@@ -1,0 +1,27 @@
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV PORT=8080
+ENV HOST=0.0.0.0
+
+WORKDIR /app
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends build-essential zlib1g-dev libjpeg-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt pyproject.toml ./
+COPY content_accessibility_utility_on_aws ./content_accessibility_utility_on_aws
+COPY templates ./templates
+COPY local_server.py ./
+COPY README_LOCAL_SERVER.md ./
+
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir waitress
+
+EXPOSE 8080
+
+CMD ["waitress-serve", "--host=0.0.0.0", "--port=8080", "local_server:app"]

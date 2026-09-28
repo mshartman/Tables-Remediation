@@ -11,6 +11,7 @@ Digital content stakeholders across industries aim to streamline how they meet a
 - [Features](#features)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
+- [Local Server](#local-server)
 - [Configuration](#configuration)
 - [Architecture](#architecture)
 - [Core Packages](#core-packages)
@@ -70,6 +71,12 @@ pip install content-accessibilty-utility-on-aws
 pip install .
 
 ```
+
+## Local Server
+
+If you want a browser-based localhost version of the PDF-to-HTML flow, see [README_LOCAL_SERVER.md](README_LOCAL_SERVER.md).
+
+For an AWS App Runner deployment of the same service, see [README_APPRUNNER.md](README_APPRUNNER.md).
 
 ## Configuration
 

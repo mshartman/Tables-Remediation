@@ -18,9 +18,19 @@ from content_accessibility_utility_on_aws.utils.logging_helper import (
 from content_accessibility_utility_on_aws.remediate.services.bedrock_client import (
     BedrockClient,
 )
+from content_accessibility_utility_on_aws.remediate.remediation_strategies.table_pipeline import (
+    TableRemediationPipeline,
+)
 
 # Set up module-level logger
 logger = setup_logger(__name__)
+
+
+def _extract_bedrock_client(args: tuple) -> Optional[BedrockClient]:
+    for arg in args:
+        if arg is not None and isinstance(arg, BedrockClient):
+            return arg
+    return None
 
 
 def get_table_from_issue(soup: BeautifulSoup, issue: Dict[str, Any]) -> Optional[Tag]:
@@ -221,8 +231,22 @@ def remediate_table_missing_headers(
     if not table:
         return None
 
+    bedrock_client = _extract_bedrock_client(args)
+
     # Check if the table has any th elements
     if not table.find("th"):
+        context_changes = TableRemediationPipeline(
+            soup, bedrock_client
+        ).analyze_and_apply_context(table, apply_caption=False)
+        if context_changes.get("header_row"):
+            message = (
+                "Added AI-inferred header row to table: "
+                f"{context_changes['header_row']}"
+            )
+            if context_changes.get("caption"):
+                message += f"; also added caption: {context_changes['caption']}"
+            return message
+
         # Get the first row
         first_row = table.find("tr")
         if first_row:
@@ -709,6 +733,16 @@ def remediate_table_missing_caption(
         return None
 
     if not table.find("caption"):
+        bedrock_client = _extract_bedrock_client(args)
+        context_changes = TableRemediationPipeline(
+            soup, bedrock_client
+        ).analyze_and_apply_context(table, apply_header_row=False)
+        if context_changes.get("caption"):
+            return (
+                "Added AI-inferred caption to table: "
+                f"{context_changes['caption']}"
+            )
+
         logger.debug("Adding caption to table")
         # Try to generate a caption based on context
         caption_text = "Table data"

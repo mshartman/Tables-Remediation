@@ -102,6 +102,10 @@ temp/
 output/
 remediated/
 uploads/
+dist/
+
+!templates/
+!templates/*.html
 
 # Specific to this project
 .aws-sam/

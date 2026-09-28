@@ -1,6 +1,3 @@
-# Copyright 2025 Amazon.com, Inc. or its affiliates.
-# SPDX-License-Identifier: Apache-2.0
-
 """
 Document structure remediation strategies.
 
@@ -101,9 +98,6 @@ def remediate_missing_language(
 
     # Set default language as English
     lang_code = "en"
-
-    # Future enhancement: detect language based on content using a language detection library
-    # For now, use English as the default language
 
     html["lang"] = lang_code
     return f"Added language attribute: lang='{lang_code}'"
