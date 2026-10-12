@@ -10,7 +10,10 @@ from html import escape
 from pathlib import Path
 from typing import Iterable
 
-from .local_table_customization import LOCAL_TABLE_LAB_POLICY, LocalTableLabPolicy
+try:
+    from .local_table_customization import LOCAL_TABLE_LAB_POLICY, LocalTableLabPolicy
+except ImportError:  # Allows the small student-worker package to run standalone.
+    from local_table_customization import LOCAL_TABLE_LAB_POLICY, LocalTableLabPolicy
 
 
 def _clean_cell(value: object) -> str:

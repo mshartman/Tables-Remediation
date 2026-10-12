@@ -20,6 +20,6 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 
 Write-Host "Installing Table Lab dependencies..."
 & $venvPython -m pip install --upgrade pip
-& $venvPython -m pip install -r (Join-Path $projectRoot "requirements.txt") -e $projectRoot
+& $venvPython -m pip install -r (Join-Path $projectRoot "requirements-table-lab.txt")
 
 Write-Host "Setup complete. Run .\student_table_lab\run-table-lab.ps1 to start the local Table Lab."
