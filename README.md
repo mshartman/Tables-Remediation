@@ -7,7 +7,36 @@ This repository provides two complementary solutions for PDF accessibility:
 
 Both solutions leverage AWS services and generative AI to improve content accessibility according to WCAG 2.1 Level AA standards.
 
-## Disclaimers
+## Current Stony Brook PDF-to-HTML Code
+
+The current customized service and local reader tools live in [`pdf2html/`](pdf2html/).
+The original upstream PDF-to-PDF solution and infrastructure remain below.
+
+- [Local reader setup](pdf2html/README_MVP.md)
+- [App Runner service](pdf2html/README_APPRUNNER.md)
+- [Private S3 completed-results storage](pdf2html/S3_RESULTS.md)
+- [Usage analytics](pdf2html/USAGE_ANALYTICS.md)
+- [NVDA/Chrome test checklist](pdf2html/SCREEN_READER_TEST.md)
+
+The colleague-supplied page-faithful renderer is deliberately PRIVATE and is not
+included in this repository. The public build retains the legacy reader and the
+local extraction tools. Use `READER_LAYOUT_MODE=legacy` on public-clone deployments;
+geometry/BDA layout modes need an authorized private add-on. See the
+[layout package boundary](pdf2html/experimental_layout/README.md).
+
+For an offline public-only smoke suite, install the dependencies described in
+the setup guides, then run from `pdf2html`:
+
+```powershell
+python -m unittest test_public_distribution test_result_storage test_usage_analytics -q
+```
+
+Some other layout/corpus tests intentionally require the private renderer or
+local PDF fixtures; they are not the public-only smoke suite. Local runs, source
+PDFs, generated documents, dependency folders and credentials are excluded from
+new commits. This is not WCAG certification or production patron authentication.
+
+## Upstream Disclaimers
 Customers are responsible for making their own independent assessment of the information in this document.
 
 This document:

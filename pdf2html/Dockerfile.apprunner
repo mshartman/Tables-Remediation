@@ -4,6 +4,16 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
 ENV HOST=0.0.0.0
+ENV CAMPUS_VISION_ENABLED=false
+ENV OLLAMA_ENABLED=false
+ENV IMAGE_ALT_PROVIDER=openai
+ENV OPENAI_ALT_MODEL=gpt-5-nano
+ENV OPENAI_ALT_DETAIL=high
+ENV OPENAI_ALT_MAX_IMAGES=4
+ENV READER_LAYOUT_MODE=legacy
+ENV ACCESSIBLE_HTML_ANALYTICS_ENABLED=true
+ENV RESULTS_S3_ENABLED=false
+ENV RESULTS_RETENTION_BASIS=first_conversion
 
 WORKDIR /app
 
@@ -11,14 +21,24 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends build-essential zlib1g-dev libjpeg-dev && \
     rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt pyproject.toml ./
+COPY requirements.txt requirements-layout.txt pyproject.toml ./
 COPY content_accessibility_utility_on_aws ./content_accessibility_utility_on_aws
 COPY templates ./templates
 COPY local_server.py ./
+COPY usage_analytics.py ./
+COPY result_storage.py ./
+COPY reader_view.py ./
+COPY image_descriptions.py reader_links.py reader_regions.py ./
+COPY reader_polish.py reader_audit.py ./
+COPY openai_descriptions.py ./
+COPY layout_pipeline.py layout_compare.py layout_presentation.py layout_structure.py layout_tables.py layout_raster.py layout_annotations.py pdf_reader_extract.py ./
+COPY reader_tables.py reader_frontmatter.py reader_structure.py reader_cleanup.py reader_figures.py ./
+COPY experimental_layout ./experimental_layout
 COPY README_LOCAL_SERVER.md ./
 
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir -r requirements-layout.txt && \
     pip install --no-cache-dir -e . && \
     pip install --no-cache-dir waitress
 

@@ -1,5 +1,12 @@
 # App Runner Deployment
 
+For the current step-by-step testing relaunch, use [AWS_RELAUNCH.md](AWS_RELAUNCH.md).
+This image runs the existing BDA/Bedrock pipeline, not reader_local.py's local PDF extractor.
+Do not treat this service as production-ready: in-progress jobs still use ephemeral
+storage and in-process threads, and patron authorization and durable background
+execution still need work. Optional completed-result persistence is described in
+[S3_RESULTS.md](S3_RESULTS.md); it is disabled until explicitly configured.
+
 This service can be deployed to AWS App Runner as a low-traffic HTTPS API for on-demand accessible HTML generation.
 
 ## What This Gives You
@@ -10,13 +17,19 @@ This service can be deployed to AWS App Runner as a low-traffic HTTPS API for on
 
 ## Important Limitation
 
-This current App Runner packaging still stores job files on the container filesystem under `local_runs/`.
+By default, job files live on the container filesystem under `local_runs/` and
+do not survive container replacement reliably. The optional S3 results mode now
+stores completed pages, assets, ZIPs, job metadata and cache mappings in a private
+bucket. Completed results then survive redeployments without a DynamoDB table.
+It also clears successful jobs' temporary working copies after saving them.
 
-That means:
-
-- completed jobs are not durable across container replacement or redeploys
-- this is acceptable for a first pilot, but not ideal for long-term production
-- the next production-hardening step is moving job state to DynamoDB and output files to S3
+See [S3_RESULTS.md](S3_RESULTS.md) for permissions, lifecycle cleanup, retention
+choices and deployment tests. This does not preserve unfinished jobs, migrate
+old local-only results, or add patron authentication. The current website sends
+no delivery timestamp: the approved default is 30 days from the first conversion
+request (`RESULTS_RETENTION_BASIS=first_conversion`). Reuse does not extend it.
+This is separate from the ILLiad PDF notice of 30 days from delivery. Integrate
+the real delivery date before selecting optional delivery-based retention.
 
 ## Build The Container
 
@@ -86,8 +99,9 @@ Attach an instance role that allows the service to:
 At minimum, review permissions for:
 
 - `bedrock:InvokeModel`
-- `bedrock-data-automation:*` or a narrowed equivalent
-- `bedrock-data-automation-runtime:*` or a narrowed equivalent
+- `bedrock:InvokeDataAutomationAsync`
+- `bedrock:GetDataAutomationStatus`
+- Additional project/profile operations required by the converter; scope these using IAM and actual access-denied diagnostics.
 - `s3:GetObject`
 - `s3:PutObject`
 - `s3:ListBucket`
@@ -115,9 +129,6 @@ If you keep the default `/accessible-html`, place CloudFront or another reverse 
 
 ## Recommended Next Step
 
-Once the pilot works, migrate:
-
-- job metadata from `job_status.json` to DynamoDB
-- generated files from `local_runs/` to S3
-
-That will make results survive restarts and redeploys.
+Enable and verify the optional S3 completed-results mode first. For further
+hardening, add a durable queue/worker design, distributed job coordination and
+patron authorization. S3 persistence by itself does not solve those concerns.

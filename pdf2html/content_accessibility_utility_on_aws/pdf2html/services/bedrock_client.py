@@ -686,9 +686,16 @@ class ExtendedBDAClient(BDAClient):
             except Exception as track_error:
                 logger.warning(f"Failed to track BDA usage: {track_error}")
             
+            # Keep the full element geometry separately from the image-only result_data.
+            layout_structure_path = None
+            if options.get('preserve_layout_structure'):
+                layout_structure_path = os.path.join(output_dir, 'bda-layout-structure.json')
+                shutil.copyfile(result_json, layout_structure_path)
+
             # Return the results
             return {
                 "html_files": extract_result["html_files"],
+                "bda_layout_structure_path": layout_structure_path,
                 "html_path": (
                     extract_result["html_files"][0]
                     if extract_result["html_files"]
