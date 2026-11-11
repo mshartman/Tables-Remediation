@@ -1,4 +1,7 @@
 import os
+import re
+import hashlib
+import hmac
 import json
 import shutil
 import threading
@@ -7,11 +10,17 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+from reader_view import render_reader, suggest_headings
+from openai_descriptions import describe_openai
+from layout_pipeline import build_layout_preview, refresh_layout_review, preview_path
+from usage_analytics import JobTimer, correlation, enabled as analytics_enabled, provider_metrics, record_event
+from result_storage import get_store, JOB_ID, artifact_name, expired, retention, StorageUnavailable, ResultExpired, RetentionError
 
 from bs4 import BeautifulSoup
 from bs4 import NavigableString
 from bs4 import Tag
-from flask import Flask, abort, jsonify, render_template, request, send_file, send_from_directory, url_for
+from flask import Flask, Response, abort, g, jsonify, render_template, request, send_file, send_from_directory, url_for
+from werkzeug.http import dump_options_header
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
@@ -98,7 +107,11 @@ def _read_job_status(job_dir: Path) -> dict | None:
     status_path = _job_status_path(job_dir)
     if not status_path.exists():
         return None
-    return json.loads(status_path.read_text(encoding="utf-8"))
+    try:
+        value = json.loads(status_path.read_text(encoding='utf-8'))
+        return value if isinstance(value, dict) else None
+    except (ValueError, OSError):
+        return None
 
 
 def _iter_job_statuses() -> list[tuple[str, dict]]:
@@ -107,24 +120,40 @@ def _iter_job_statuses() -> list[tuple[str, dict]]:
 
     jobs = []
     for job_dir in sorted((p for p in RUNS_DIR.iterdir() if p.is_dir()), reverse=True):
+        if not JOB_ID.fullmatch(job_dir.name):
+            continue
         status = _read_job_status(job_dir)
         if status:
             jobs.append((job_dir.name, status))
     return jobs
 
 
-def _find_existing_job(transaction_number: str) -> tuple[str, dict] | None:
+def _find_existing_job(transaction_number: str, workflow='full', source_sha256=None) -> tuple[str, dict] | None:
     if not transaction_number:
         return None
+    store = get_store()
+    if store:
+        stored = store.find(transaction_number, workflow, source_sha256)
+        if stored:
+            return stored
 
     for job_id, status in _iter_job_statuses():
         if status.get("transaction_number") != transaction_number:
             continue
+        if status.get('remediation_mode', 'full') != workflow:
+            continue
+        if store and not hmac.compare_digest(status.get('source_sha256', ''), source_sha256 or ''):
+            continue
+        if expired(status):
+            raise ResultExpired()
 
         job_dir = RUNS_DIR / job_id
         job_status = status.get("status")
 
         if job_status == "completed":
+            if status.get('storage') == 's3':
+                # Never fall back to disk if a committed remote result disappeared.
+                raise StorageUnavailable('Stored results need recovery. Please retry later.')
             preview_filename = status.get("preview_filename")
             if not preview_filename:
                 continue
@@ -141,8 +170,130 @@ def _find_existing_job(transaction_number: str) -> tuple[str, dict] | None:
     return None
 
 
+def _result_record(job_id):
+    records = g.setdefault('stored_results', {})
+    if job_id not in records:
+        store = get_store()
+        records[job_id] = store.get_record(job_id) if store else None
+    return records[job_id]
+
+
+def _available_status(job_id):
+    record = _result_record(job_id)
+    if record:
+        return record['status']
+    status = _read_job_status(RUNS_DIR / job_id)
+    if status and expired(status):
+        raise ResultExpired()
+    if status and status.get('storage') == 's3':
+        raise StorageUnavailable('Stored results need recovery. Please retry later.')
+    return status
+
+
+def _public_status(status):
+    return {key: value for key, value in status.items()
+            if key not in {'transaction_number', 'zip_path', 'traceback', 'source_sha256'}}
+
+
+def _request_retention(payload=None):
+    if not get_store():
+        return {}
+    return retention(request.form.get('delivery_at') or (payload or {}).get('delivery_at'))
+
+
+def _complete_job(job_dir, **changes):
+    status = _read_job_status(job_dir) or {}
+    status.update(changes, status='completed', updated_at=_utc_now())
+    store = get_store()
+    if store:
+        status = store.publish(job_dir, status)
+    _write_job_status(job_dir, status)
+    return status
+
+
+def _cleanup_completed_scratch(job_dir):
+    """Only newly completed, committed S3 jobs; never touch the source PDF path."""
+    status = _read_job_status(job_dir) or {}
+    if status.get('status') != 'completed' or status.get('storage') != 's3':
+        return
+    try:
+        if (not JOB_ID.fullmatch(job_dir.name) or job_dir.is_symlink() or
+                job_dir.resolve().parent != RUNS_DIR.resolve()):
+            return
+        for child in list(job_dir.iterdir()):
+            if child.name not in {'input', 'output', status.get('zip_filename')}:
+                continue
+            if child.is_symlink() or not child.resolve().is_relative_to(job_dir.resolve()):
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            elif child.is_file():
+                child.unlink()
+    except OSError:
+        app.logger.warning('Could not clear working files for a completed S3 result.')
+
+
+def _record_manifest(job_id, record):
+    return [{'name': name, 'size_kb': round(info['size'] / 1024, 1),
+             'url': url_for('serve_job_file', job_id=job_id, filename=name)}
+            for name, info in sorted(record['files'].items())]
+
+
+def _stored_response(job_id, filename, attachment=False):
+    record = _result_record(job_id)
+    if not record:
+        return None
+    byte_range = request.headers.get('Range')
+    if byte_range and not re.fullmatch(r'bytes=(?:[0-9]+-[0-9]*|-[0-9]+)', byte_range):
+        abort(416)
+    try:
+        obj = get_store().object(record, filename, head=request.method == 'HEAD', byte_range=byte_range)
+    except ValueError:
+        abort(416)
+    if obj is None:
+        abort(404)
+    body = obj.get('Body')
+    def chunks():
+        try:
+            yield from body.iter_chunks(chunk_size=64 * 1024)
+        finally:
+            body.close()
+    response = Response(chunks() if body else b'', status=206 if obj.get('ContentRange') else 200,
+                        content_type=record['files'][filename]['content_type'])
+    if body:
+        response.call_on_close(body.close)
+    for source, target in (('ContentLength', 'Content-Length'), ('ContentRange', 'Content-Range'), ('ETag', 'ETag')):
+        if source in obj:
+            response.headers[target] = str(obj[source])
+    response.headers['Accept-Ranges'] = 'bytes'
+    if attachment:
+        response.headers['Content-Disposition'] = dump_options_header('attachment', {'filename': Path(filename).name})
+    return response
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _analytics_usage(output_dir: Path, local_only: bool = False) -> dict:
+    """Snapshot provider totals while PROCESS_LOCK still owns the singleton."""
+    try:
+        if not analytics_enabled():
+            return {}
+        if local_only:
+            return provider_metrics()
+        tracker = SessionUsageTracker._instance
+        aws = {'bda_usage': tracker.bda_usage, 'bedrock_usage': tracker.bedrock_usage} if tracker else None
+        report_path = output_dir / 'openai-image-report.json'
+        openai = None
+        try:
+            if report_path.is_file() and report_path.stat().st_size <= 1024**2:
+                openai = json.loads(report_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            pass
+        return provider_metrics(aws, openai)
+    except Exception:
+        return {}
 
 
 def _detect_image_dir(conversion_result: dict, html_path: Path) -> str | None:
@@ -367,341 +518,17 @@ def _build_generated_page_nav(soup: BeautifulSoup, pages: list[Tag]) -> Tag | No
     return page_nav
 
 
-def _style_html_output(html_file_path: Path, document_name: str) -> None:
-    if not html_file_path.exists() or html_file_path.suffix.lower() != ".html":
-        return
-
-    soup = BeautifulSoup(html_file_path.read_text(encoding="utf-8"), "html.parser")
-
-    if not soup.html:
-        return
-
-    if not soup.head:
-        head_tag = soup.new_tag("head")
-        soup.html.insert(0, head_tag)
-
-    if not soup.body:
-        body_tag = soup.new_tag("body")
-        soup.html.append(body_tag)
-
-    title_text = document_name
-    if soup.title:
-        existing_title = (soup.title.string or "").strip() if soup.title.string else ""
-        if existing_title and existing_title not in {"0", "Remediated Document", "Combined Document"}:
-            title_text = existing_title
-        soup.title.string = title_text
-    else:
-        title_tag = soup.new_tag("title")
-        title_tag.string = title_text
-        soup.head.append(title_tag)
-
-    if not soup.html.get("lang"):
-        soup.html["lang"] = "en"
-
-    _label_form_controls(soup)
-    _merge_adjacent_duplicate_links(soup)
-    _clean_text_artifacts(soup)
-    _demote_nested_h1s(soup)
-    pages = _annotate_pages_and_hide_breaks(soup)
-    _normalize_page_number_display(soup, pages)
-
-    while True:
-        existing_shell = soup.find(attrs={"data-accessible-html-shell": "true"})
-        if not existing_shell:
-            break
-
-        existing_content = existing_shell.find(class_="accessible-shell__content")
-        if existing_content:
-            restored_nodes = [child.extract() for child in list(existing_content.contents)]
-            existing_shell.decompose()
-            soup.body.clear()
-            for node in restored_nodes:
-                soup.body.append(node)
-        else:
-            existing_shell.decompose()
-
-    for stray_style in soup.body.find_all("style", attrs={"data-accessible-html-shell": "true"}):
-        stray_style.decompose()
-
-    for child in list(soup.body.contents):
-        if not isinstance(child, NavigableString):
-            continue
-
-        text = str(child).strip()
-        if not text:
-            child.extract()
-            continue
-
-        # Clean up previously broken renders where the CSS stylesheet was injected
-        # into the body as visible text instead of a <style> tag in <head>.
-        if ".accessible-shell" in text and "body {" in text:
-            child.extract()
-
-    existing_style = soup.find("style", attrs={"data-accessible-html-shell": "true"})
-    if not existing_style:
-        style_tag = soup.new_tag("style")
-        style_tag["data-accessible-html-shell"] = "true"
-        style_tag.string = """
-body {
-  margin: 0;
-  background: #f5f7fb;
-  color: #18202a;
-  font-family: Georgia, "Times New Roman", serif;
-  line-height: 1.65;
-}
-
-.accessible-shell {
-  max-width: 1280px;
-  margin: 0 auto;
-  padding: 32px 24px 64px;
-}
-
-.accessible-shell__header {
-  margin-bottom: 28px;
-  padding-bottom: 18px;
-  border-bottom: 1px solid #d8e0eb;
-}
-
-.accessible-shell__eyebrow {
-  margin: 0 0 8px;
-  color: #5f6f82;
-  font-size: 0.92rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-}
-
-.accessible-shell__title {
-  margin: 0;
-  color: #102033;
-  font-size: clamp(1.8rem, 3vw, 2.7rem);
-  line-height: 1.15;
-}
-
-.accessible-shell__content {
-  background: #ffffff;
-  border: 1px solid #d8e0eb;
-  border-radius: 16px;
-  padding: 28px 32px;
-  box-shadow: 0 14px 32px rgba(16, 32, 51, 0.06);
-  overflow-x: auto;
-}
-
-.accessible-shell__layout {
-  display: grid;
-  grid-template-columns: minmax(180px, 220px) minmax(0, 1fr);
-  gap: 28px;
-  align-items: start;
-}
-
-.accessible-shell__page-nav {
-  background: #ffffff;
-  border: 1px solid #d8e0eb;
-  border-radius: 16px;
-  padding: 24px 22px;
-  box-shadow: 0 14px 32px rgba(16, 32, 51, 0.06);
-  position: sticky;
-  top: 24px;
-}
-
-.accessible-shell__page-nav h2 {
-  margin: 0 0 12px;
-  color: #102033;
-  font-size: 1.05rem;
-  line-height: 1.3;
-}
-
-.accessible-shell__page-nav ul,
-.accessible-shell__page-nav ol {
-  margin: 0;
-  padding-left: 0;
-  list-style: none;
-}
-
-.accessible-shell__page-nav li + li {
-  margin-top: 0.35rem;
-}
-
-.accessible-shell__page-nav a {
-  overflow-wrap: anywhere;
-}
-
-.accessible-shell__page-label {
-  margin: 0 0 0.9rem;
-  color: #5f6f82;
-  font-size: 0.95rem;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-}
-
-.accessible-shell__content .page {
-  padding-top: 0.35rem;
-}
-
-.accessible-shell__content .page + .page {
-  margin-top: 2.5rem;
-  padding-top: 2.5rem;
-  border-top: 1px dashed #d8e0eb;
-}
-
-.accessible-shell__content img,
-.accessible-shell__content table {
-  max-width: 100%;
-}
-
-.accessible-shell__content table {
-  width: 100%;
-  min-width: 760px;
-  border-collapse: collapse;
-  border: 1px solid #63758a;
-  background: #ffffff;
-  font-family: Georgia, "Times New Roman", serif;
-  line-height: 1.4;
-}
-
-.accessible-shell__content caption {
-  padding: 0.75rem 0.9rem;
-  color: #102033;
-  font-size: 1.05rem;
-  font-weight: 700;
-  text-align: left;
-  caption-side: top;
-}
-
-.accessible-shell__content td,
-.accessible-shell__content th {
-  padding: 0.45rem 0.6rem;
-  border: 1px solid #8c9bad;
-  vertical-align: top;
-}
-
-.accessible-shell__content thead th {
-  color: #102033;
-  background: #e8eef5;
-  font-weight: 700;
-  text-align: left;
-}
-
-.accessible-shell__content tbody tr:nth-child(even):not(.table-section) {
-  background: #f7f9fc;
-}
-
-.accessible-shell__content .table-section th {
-  color: #102033;
-  background: #eef3f8;
-  font-style: italic;
-  font-weight: 700;
-  text-align: left;
-}
-
-.accessible-shell__content td:not(:first-child),
-.accessible-shell__content th:not(:first-child) {
-  white-space: nowrap;
-}
-
-@media (max-width: 900px) {
-  .accessible-shell {
-    padding: 24px 16px 48px;
-  }
-
-  .accessible-shell__layout {
-    grid-template-columns: 1fr;
-    gap: 18px;
-  }
-
-  .accessible-shell__content {
-    padding: 22px 18px;
-  }
-}
-        """
-        soup.head.append(style_tag)
-
-    shell = soup.new_tag("main")
-    shell["class"] = "accessible-shell"
-    shell["data-accessible-html-shell"] = "true"
-
-    header = soup.new_tag("header")
-    header["class"] = "accessible-shell__header"
-
-    eyebrow = soup.new_tag("p")
-    eyebrow["class"] = "accessible-shell__eyebrow"
-    eyebrow.string = "Accessible HTML View"
-    header.append(eyebrow)
-
-    title_heading = soup.new_tag("h1")
-    title_heading["class"] = "accessible-shell__title"
-    title_heading.string = title_text
-    header.append(title_heading)
-
-    content = soup.new_tag("section")
-    content["class"] = "accessible-shell__content"
-    content["aria-label"] = "Document content"
-    layout = soup.new_tag("div")
-    layout["class"] = "accessible-shell__layout"
-
-    movable_children = list(soup.body.contents)
-    page_nav_source = None
-
-    for child in movable_children:
-        if getattr(child, "name", None) not in {"ul", "ol", "nav"}:
-            continue
-
-        if child.name == "nav":
-            list_candidate = child.find(["ul", "ol"], recursive=False)
-            if not list_candidate:
-                continue
-            candidate = list_candidate
-        else:
-            candidate = child
-
-        link_nodes = candidate.find_all("a", href=True) if getattr(candidate, "find_all", None) else []
-        if len(link_nodes) < 2:
-            continue
-
-        page_links = 0
-        for link in link_nodes:
-            link_text = link.get_text(" ", strip=True).lower()
-            href = (link.get("href") or "").lower()
-            if "page" in link_text or "#page" in href:
-                page_links += 1
-
-        if page_links >= min(2, len(link_nodes)):
-            page_nav_source = candidate
-            break
-
-    page_nav = None
-    if page_nav_source is not None:
-        page_nav = soup.new_tag("nav")
-        page_nav["class"] = "accessible-shell__page-nav"
-        page_nav["aria-label"] = "Jump to page"
-
-        page_nav_heading = soup.new_tag("h2")
-        page_nav_heading.string = "Jump to page"
-        page_nav.append(page_nav_heading)
-        page_nav.append(page_nav_source.extract())
-    elif len(pages) >= 2:
-        page_nav = _build_generated_page_nav(soup, pages)
-
-    if page_nav is not None:
-        layout.append(page_nav)
-
-    for child in list(soup.body.contents):
-        content.append(child.extract())
-
-    shell.append(header)
-    if page_nav is not None:
-        layout.append(content)
-        shell.append(layout)
-    else:
-        shell.append(content)
-    soup.body.append(shell)
-
-    html_file_path.write_text(str(soup), encoding="utf-8")
-
+def _style_html_output(html_file_path: Path, document_name: str, pdf_path=None) -> None:
+    if html_file_path.exists() and html_file_path.suffix.lower() == '.html':
+        render_reader(html_file_path, document_name, pdf_path=pdf_path)
+    return
 
 def _build_file_manifest(base_dir: Path) -> list[dict]:
     files = []
     for file_path in sorted(p for p in base_dir.rglob("*") if p.is_file()):
         relative_path = file_path.relative_to(base_dir).as_posix()
+        if not artifact_name(relative_path) or file_path.is_symlink():
+            continue
         files.append(
             {
                 "name": relative_path,
@@ -729,6 +556,9 @@ def _build_job_response(job_id: str, status: dict) -> dict:
         "status_url": url_for("get_job_status", job_id=job_id, _external=True),
         "result_url": url_for("get_job_result", job_id=job_id, _external=True),
     }
+    for key in ('expires_at', 'retention_basis', 'storage'):
+        if key in status:
+            response[key] = status[key]
 
     if status.get("status") == "completed":
         preview_filename = status.get("preview_filename")
@@ -764,6 +594,7 @@ def _run_pipeline(
     conversion_options = {
         "single_file": True,
         "cleanup_bda_output": cleanup_bda_output,
+        "preserve_layout_structure": os.getenv('READER_LAYOUT_MODE', 'legacy') != 'legacy',
     }
 
     conversion_result = convert_pdf_to_html(
@@ -777,7 +608,9 @@ def _run_pipeline(
 
     html_path = Path(conversion_result["html_path"])
     document_name = _friendly_document_name(original_filename)
-    _style_html_output(html_path, document_name)
+    heading_status = suggest_headings(html_path)
+    (output_dir / 'ollama_status.json').write_text(json.dumps({'status': heading_status}), encoding='utf-8')
+    _style_html_output(html_path, document_name, pdf_path)
     image_dir = _detect_image_dir(conversion_result, html_path)
 
     audit_report_path = output_dir / "accessibility_audit.json"
@@ -797,6 +630,9 @@ def _run_pipeline(
             for issue in audit_result.get("issues", [])
             if issue.get("remediation_status") == "needs_remediation"
         ]
+        if os.getenv('IMAGE_ALT_PROVIDER', 'bedrock') == 'openai':
+            remediation_issues = [issue for issue in remediation_issues
+                                  if 'alt-text' not in issue.get('type', '')]
         if table_only:
             remediation_issues = [
                 issue for issue in remediation_issues if _is_table_issue(issue)
@@ -821,7 +657,7 @@ def _run_pipeline(
             image_dir=image_dir,
         )
         if remediation_result and remediation_result.get("remediated_html_path"):
-            _style_html_output(Path(remediation_result["remediated_html_path"]), document_name)
+            _style_html_output(Path(remediation_result["remediated_html_path"]), document_name, pdf_path)
 
         remediation_report_path = output_dir / "remediation_report.html"
         generate_remediation_report(
@@ -830,6 +666,29 @@ def _run_pipeline(
             report_format="html",
         )
 
+    legacy_target = Path(remediation_result['remediated_html_path']) if remediation_result and remediation_result.get('remediated_html_path') else html_path
+    layout_target = None if table_only else build_layout_preview(
+        pdf_path, output_dir, legacy_target, conversion_result, document_name)
+    target = layout_target or legacy_target
+    if perform_remediation and not table_only and os.getenv('IMAGE_ALT_PROVIDER', 'bedrock') == 'openai':
+        described, image_report = describe_openai(
+            target.read_text(encoding='utf-8'), image_root=output_dir,
+            asset_base=[target.parent, html_path.parent])
+        target.write_text(described, encoding='utf-8')
+        (output_dir / 'openai-image-report.json').write_text(json.dumps(image_report, indent=2), encoding='utf-8')
+        if not layout_target:
+            _style_html_output(target, document_name, pdf_path)
+    if layout_target:
+        try:
+            refresh_layout_review(layout_target)
+        except Exception as exc:
+            # A presentation-only failure must not discard the legacy conversion.
+            layout_target = None
+            (output_dir / 'layout-status.json').write_text(json.dumps({
+                'status': 'fallback', 'preview': 'legacy', 'error_type': type(exc).__name__,
+                'message': 'Final layout review failed; the original reader was retained.'
+            }, indent=2), encoding='utf-8')
+
     usage_data_path = save_usage_data(
         output_path=str(output_dir / "usage_data.json"),
         profile=aws_profile or None,
@@ -837,6 +696,7 @@ def _run_pipeline(
 
     return {
         "conversion_result": conversion_result,
+        "layout_preview_path": layout_target,
         "audit_result": audit_result,
         "remediation_result": remediation_result,
         "audit_report_path": audit_report_path,
@@ -933,7 +793,7 @@ def _run_local_table_pipeline(
     }
 
 
-def _create_job(job_dir: Path, original_filename: str, source_type: str) -> dict:
+def _create_job(job_dir: Path, original_filename: str, source_type: str, retention_fields=None) -> dict:
     status = {
         "status": "queued",
         "source_type": source_type,
@@ -941,6 +801,9 @@ def _create_job(job_dir: Path, original_filename: str, source_type: str) -> dict
         "created_at": _utc_now(),
         "updated_at": _utc_now(),
     }
+    status.update(retention_fields or {})
+    if retention_fields:
+        status['storage'] = 's3_pending'
     _write_job_status(job_dir, status)
     return status
 
@@ -965,50 +828,53 @@ def _start_background_job(
     cleanup_bda_output: bool,
     table_only: bool = False,
     local_table_lab: bool = False,
+    analytics_context: dict = None,
 ) -> None:
     job_dir = RUNS_DIR / job_id
     output_dir = job_dir / "output"
+    workflow = 'local_tables' if local_table_lab else 'tables' if table_only else 'full'
+    timer = JobTimer('api', workflow, analytics_context)
 
     def runner() -> None:
-        _update_job(job_dir, status="processing")
         try:
             with PROCESS_LOCK:
-                if local_table_lab:
-                    result = _run_local_table_pipeline(
-                        pdf_path=pdf_path,
-                        output_dir=output_dir,
-                        original_filename=original_filename,
-                        perform_remediation=perform_remediation,
-                    )
-                else:
-                    result = _run_pipeline(
-                        pdf_path=pdf_path,
-                        output_dir=output_dir,
-                        original_filename=original_filename,
-                        bda_project_arn=bda_project_arn,
-                        s3_bucket=s3_bucket,
-                        aws_profile=aws_profile,
-                        model_id=model_id,
-                        perform_remediation=perform_remediation,
-                        cleanup_bda_output=cleanup_bda_output,
-                        table_only=table_only,
-                    )
+                timer.start()
+                _update_job(job_dir, status="processing")
+                if expired(_read_job_status(job_dir) or {}):
+                    raise ResultExpired()
+                try:
+                    if local_table_lab:
+                        result = _run_local_table_pipeline(
+                            pdf_path=pdf_path,
+                            output_dir=output_dir,
+                            original_filename=original_filename,
+                            perform_remediation=perform_remediation,
+                        )
+                    else:
+                        result = _run_pipeline(
+                            pdf_path=pdf_path,
+                            output_dir=output_dir,
+                            original_filename=original_filename,
+                            bda_project_arn=bda_project_arn,
+                            s3_bucket=s3_bucket,
+                            aws_profile=aws_profile,
+                            model_id=model_id,
+                            perform_remediation=perform_remediation,
+                            cleanup_bda_output=cleanup_bda_output,
+                            table_only=table_only,
+                        )
+                finally:
+                    timer.fields.update(_analytics_usage(output_dir, local_table_lab))
 
             zip_path = _zip_directory(output_dir, job_dir / f"{pdf_path.stem}_results.zip")
             conversion_result = result["conversion_result"]
             audit_result = result["audit_result"]
             remediation_result = result["remediation_result"]
 
-            if remediation_result and remediation_result.get("remediated_html_path"):
-                preview_target = (
-                    Path(remediation_result["remediated_html_path"]).relative_to(job_dir).as_posix()
-                )
-            else:
-                preview_target = Path(conversion_result["html_path"]).relative_to(job_dir).as_posix()
+            preview_target = preview_path(result).relative_to(job_dir).as_posix()
 
-            _update_job(
+            _complete_job(
                 job_dir,
-                status="completed",
                 original_filename=original_filename,
                 issues_found=len(audit_result.get("issues", [])),
                 issues_needing_remediation=len(
@@ -1023,8 +889,12 @@ def _start_background_job(
                 issues_selected_for_remediation=result["issues_selected_for_remediation"],
                 preview_filename=preview_target,
                 zip_path=str(zip_path),
+                zip_filename=zip_path.name,
             )
+            timer.complete(result)
+            _cleanup_completed_scratch(job_dir)
         except Exception as exc:
+            timer.fail(exc)
             _update_job(
                 job_dir,
                 status="failed",
@@ -1033,8 +903,13 @@ def _start_background_job(
                 traceback=traceback.format_exc(),
             )
 
-    thread = threading.Thread(target=runner, daemon=True)
-    thread.start()
+    try:
+        thread = threading.Thread(target=runner, daemon=True)
+        thread.start()
+    except Exception as exc:
+        timer.fail(exc)
+        _update_job(job_dir, status='failed', error='The processing worker could not start.')
+        raise
 
 
 @app.get("/")
@@ -1072,13 +947,70 @@ def health():
     return {"status": "ok"}
 
 
+@app.errorhandler(StorageUnavailable)
+def storage_unavailable(error):
+    return jsonify({'error': 'Stored results are temporarily unavailable. Please retry opening the result later; avoid resubmitting the PDF.'}), 503, {'Retry-After': '30'}
+
+
+@app.errorhandler(ResultExpired)
+def result_expired(error):
+    return jsonify({'status': 'expired', 'error': 'This generated webpage has reached its retention deadline and is no longer available.'}), 410
+
+
+@app.errorhandler(RetentionError)
+def retention_error(error):
+    return jsonify({'error': str(error)}), 400
+
+
+@app.before_request
+def analytics_submission():
+    job_id = (request.view_args or {}).get('job_id')
+    if job_id is not None and not JOB_ID.fullmatch(job_id):
+        abort(404)
+    if request.method == 'POST' and request.endpoint in {'create_job', 'process_pdf'}:
+        record_event('submission_requested', channel='api' if request.endpoint == 'create_job' else 'form')
+
+
+@app.after_request
+def analytics_response(response):
+    try:
+        if not analytics_enabled():
+            return response
+        if request.method == 'POST' and request.endpoint in {'create_job', 'process_pdf'} and response.status_code >= 400:
+            record_event('submission_error', channel='api' if request.endpoint == 'create_job' else 'form', http_status=response.status_code)
+        elif request.method == 'GET' and request.endpoint == 'serve_job_file':
+            args = request.view_args or {}
+            if not JOB_ID.fullmatch(args.get('job_id', '')):
+                return response
+            filename = args.get('filename', '')
+            if filename.lower().endswith('.html'):
+                status = _available_status(args['job_id']) or {}
+                kind = ('selected_preview' if filename == status.get('preview_filename') else
+                        'legacy_preview' if not status and filename in {
+                            'output/remediated.html', 'output/layout/layout.html', 'output/local_table_extraction.html'
+                        } else 'other_html')
+                context = correlation(request.headers.get('X-Accessible-Reader-Id'),
+                                      status.get('transaction_number'), args['job_id'])
+                record_event('html_response', html_kind=kind, http_status=response.status_code, **context)
+        elif request.method == 'GET' and request.endpoint == 'download_job_zip':
+            record_event('zip_response', http_status=response.status_code)
+    except Exception:
+        pass  # A missing/corrupt analytics source must not affect HTTP delivery.
+    return response
+
+
 @app.after_request
 def add_cors_headers(response):
+    if request.path.startswith(('/runs/', '/api/jobs', '/api/table-jobs')):
+        # Expiration is enforced server-side, not by a stale browser/proxy cache.
+        response.headers['Cache-Control'] = 'no-store'
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Referrer-Policy'] = 'no-referrer'
     if ALLOWED_ORIGIN:
         response.headers["Access-Control-Allow-Origin"] = ALLOWED_ORIGIN
         response.headers["Vary"] = "Origin"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Accessible-Reader-Id"
     return response
 
 
@@ -1124,11 +1056,14 @@ def process_pdf():
             error="Only PDF uploads are supported.",
         ), 400
 
-    job_id = uuid.uuid4().hex[:12]
+    retention_fields = _request_retention()
+    job_id = uuid.uuid4().hex
     job_dir = RUNS_DIR / job_id
     input_dir, output_dir = _ensure_run_dirs(job_dir)
     pdf_path = input_dir / safe_name
     uploaded_file.save(pdf_path)
+    if get_store():
+        _create_job(job_dir, uploaded_file.filename, 'upload', retention_fields)
 
     perform_remediation = _bool_from_form("perform_remediation", default=True)
     cleanup_bda_output = _bool_from_form("cleanup_bda_output", default=True)
@@ -1136,30 +1071,37 @@ def process_pdf():
     s3_bucket = request.form.get("s3_bucket", "").strip()
     aws_profile = request.form.get("aws_profile", "").strip()
     model_id = request.form.get("model_id", "us.amazon.nova-lite-v1:0").strip()
+    timer = JobTimer('form', 'local_tables' if table_only else 'full',
+                     correlation(request.form.get('reader_client_id'), job_id=job_id))
 
     try:
         with PROCESS_LOCK:
-            if table_only:
-                result = _run_local_table_pipeline(
-                    pdf_path=pdf_path,
-                    output_dir=output_dir,
-                    original_filename=uploaded_file.filename,
-                    perform_remediation=perform_remediation,
-                )
-            else:
-                result = _run_pipeline(
-                    pdf_path=pdf_path,
-                    output_dir=output_dir,
-                    original_filename=uploaded_file.filename,
-                    bda_project_arn=bda_project_arn,
-                    s3_bucket=s3_bucket,
-                    aws_profile=aws_profile,
-                    model_id=model_id,
-                    perform_remediation=perform_remediation,
-                    cleanup_bda_output=cleanup_bda_output,
-                    table_only=False,
-                )
+            timer.start()
+            try:
+                if table_only:
+                    result = _run_local_table_pipeline(
+                        pdf_path=pdf_path,
+                        output_dir=output_dir,
+                        original_filename=uploaded_file.filename,
+                        perform_remediation=perform_remediation,
+                    )
+                else:
+                    result = _run_pipeline(
+                        pdf_path=pdf_path,
+                        output_dir=output_dir,
+                        original_filename=uploaded_file.filename,
+                        bda_project_arn=bda_project_arn,
+                        s3_bucket=s3_bucket,
+                        aws_profile=aws_profile,
+                        model_id=model_id,
+                        perform_remediation=perform_remediation,
+                        cleanup_bda_output=cleanup_bda_output,
+                        table_only=False,
+                    )
+            finally:
+                timer.fields.update(_analytics_usage(output_dir, table_only))
     except Exception as exc:
+        timer.fail(exc)
         return render_template(
             "index.html",
             defaults={
@@ -1174,18 +1116,27 @@ def process_pdf():
             traceback_text=traceback.format_exc(),
         ), 500
 
-    zip_path = _zip_directory(output_dir, job_dir / f"{pdf_path.stem}_results.zip")
-    files = _build_file_manifest(job_dir)
+    try:
+        zip_path = _zip_directory(output_dir, job_dir / f"{pdf_path.stem}_results.zip")
+        if get_store():
+            _complete_job(job_dir, original_filename=uploaded_file.filename,
+                          preview_filename=preview_path(result).relative_to(job_dir).as_posix(),
+                          zip_filename=zip_path.name, remediation_mode='local_tables' if table_only else 'full',
+                          issues_found=len(result['audit_result'].get('issues', [])),
+                          issues_remediated=(result.get('remediation_result') or {}).get('issues_remediated', 0))
+    except Exception as exc:
+        timer.fail(exc)
+        raise
+    timer.complete(result)
+    _cleanup_completed_scratch(job_dir)
+    stored_record = _result_record(job_id)
+    files = _record_manifest(job_id, stored_record) if stored_record else _build_file_manifest(job_dir)
 
     conversion_result = result["conversion_result"]
     audit_result = result["audit_result"]
     remediation_result = result["remediation_result"]
 
-    preview_target = None
-    if remediation_result and remediation_result.get("remediated_html_path"):
-        preview_target = Path(remediation_result["remediated_html_path"]).relative_to(job_dir).as_posix()
-    else:
-        preview_target = Path(conversion_result["html_path"]).relative_to(job_dir).as_posix()
+    preview_target = preview_path(result).relative_to(job_dir).as_posix()
 
     return render_template(
         "results.html",
@@ -1213,20 +1164,42 @@ def process_pdf():
 def create_job():
     uploaded_file = request.files.get("pdf_file")
     payload = request.get_json(silent=True) or {}
-
-    job_id = uuid.uuid4().hex[:12]
-    job_dir = RUNS_DIR / job_id
-    input_dir, _ = _ensure_run_dirs(job_dir)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'The JSON request must be an object.'}), 400
 
     transaction_number = (
         (request.form.get("transaction_number") if uploaded_file else payload.get("transaction_number"))
         or ""
-    ).strip()
+    )
+    if not isinstance(transaction_number, str) or len(transaction_number) > 80:
+        return jsonify({'error': 'Invalid transaction number.'}), 400
+    transaction_number = transaction_number.strip()
+    client_id = request.form.get('reader_client_id') if uploaded_file else payload.get('reader_client_id')
+    retention_fields = _request_retention(payload)
+    table_only = request.path == '/api/table-jobs' or (
+        _bool_from_form('table_only') if uploaded_file else _bool_value(payload.get('table_only')))
+    workflow = 'local_tables' if request.path == '/api/table-jobs' else 'tables' if table_only else 'full'
+    source_sha256 = None
+    if get_store():
+        if not uploaded_file or not uploaded_file.filename:
+            return jsonify({'error': 'S3-backed jobs require a PDF upload, including cache lookups.'}), 400
+        digest = hashlib.sha256()
+        for block in iter(lambda: uploaded_file.stream.read(1024 * 1024), b''):
+            digest.update(block)
+        uploaded_file.stream.seek(0)
+        source_sha256 = digest.hexdigest()
 
-    existing_job = _find_existing_job(transaction_number)
+    existing_job = _find_existing_job(transaction_number, workflow, source_sha256)
     if existing_job:
         existing_job_id, existing_status = existing_job
-        return jsonify(_build_job_response(existing_job_id, existing_status) | {"details": existing_status}), 200
+        record_event('job_cache_hit', channel='api', workflow=existing_status.get('remediation_mode', 'full'),
+                     cache_state=existing_status.get('status'),
+                     **correlation(client_id, transaction_number, existing_job_id))
+        return jsonify(_build_job_response(existing_job_id, existing_status) | {"details": _public_status(existing_status)}), 200
+
+    job_id = uuid.uuid4().hex
+    job_dir = RUNS_DIR / job_id
+    input_dir, _ = _ensure_run_dirs(job_dir)
 
     if uploaded_file and uploaded_file.filename:
         safe_name = secure_filename(uploaded_file.filename)
@@ -1285,9 +1258,12 @@ def create_job():
     )
     local_table_lab = request.path == "/api/table-jobs"
 
-    status = _create_job(job_dir, original_filename=original_filename, source_type=source_type)
+    status = _create_job(job_dir, original_filename=original_filename, source_type=source_type,
+                         retention_fields=retention_fields)
     if transaction_number:
         status = _update_job(job_dir, transaction_number=transaction_number)
+    if source_sha256:
+        status = _update_job(job_dir, source_sha256=source_sha256)
     if table_only:
         status = _update_job(
             job_dir,
@@ -1305,6 +1281,7 @@ def create_job():
         cleanup_bda_output=cleanup_bda_output,
         table_only=table_only,
         local_table_lab=local_table_lab,
+        analytics_context=correlation(client_id, transaction_number, job_id),
     )
     return jsonify(_build_job_response(job_id, status)), 202
 
@@ -1312,14 +1289,11 @@ def create_job():
 @app.get("/api/jobs/<job_id>")
 def get_job_status(job_id: str):
     job_dir = RUNS_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"error": "Job not found."}), 404
-
-    status = _read_job_status(job_dir)
+    status = _available_status(job_id)
     if not status:
         return jsonify({"error": "Job status unavailable."}), 404
 
-    if status.get("status") == "completed":
+    if status.get("status") == "completed" and not _result_record(job_id):
         preview_filename = status.get("preview_filename")
         if not preview_filename or not (job_dir / Path(preview_filename)).exists():
             status = _update_job(
@@ -1328,19 +1302,17 @@ def get_job_status(job_id: str):
                 error="Generated HTML is no longer available and must be regenerated.",
             )
 
-    return jsonify(_build_job_response(job_id, status) | {"details": status})
+    return jsonify(_build_job_response(job_id, status) | {"details": _public_status(status)})
 
 
 @app.get("/api/jobs/<job_id>/result")
 def get_job_result(job_id: str):
     job_dir = RUNS_DIR / job_id
-    if not job_dir.exists():
-        return jsonify({"error": "Job not found."}), 404
-
-    status = _read_job_status(job_dir)
+    status = _available_status(job_id)
     if not status:
         return jsonify({"error": "Job status unavailable."}), 404
-    if status.get("status") == "completed":
+    record = _result_record(job_id)
+    if status.get("status") == "completed" and not record:
         preview_filename = status.get("preview_filename")
         if not preview_filename or not (job_dir / Path(preview_filename)).exists():
             status = _update_job(
@@ -1351,7 +1323,7 @@ def get_job_result(job_id: str):
     if status.get("status") != "completed":
         return jsonify(_build_job_response(job_id, status)), 409
 
-    files = _build_file_manifest(job_dir)
+    files = _record_manifest(job_id, record) if record else _build_file_manifest(job_dir)
     return jsonify(
         _build_job_response(job_id, status)
         | {
@@ -1367,6 +1339,14 @@ def get_job_result(job_id: str):
 
 @app.get("/runs/<job_id>/<path:filename>")
 def serve_job_file(job_id: str, filename: str):
+    if not artifact_name(filename):
+        abort(404)
+    status = _available_status(job_id)  # Enforce expiry even if an old local copy remains.
+    if status and status.get('storage') == 's3_pending':
+        return jsonify({'error': 'This result has not been committed to durable storage.'}), 409
+    stored = _stored_response(job_id, filename)
+    if stored is not None:
+        return stored
     job_dir = RUNS_DIR / job_id
     if not job_dir.exists():
         abort(404)
@@ -1375,6 +1355,12 @@ def serve_job_file(job_id: str, filename: str):
 
 @app.get("/runs/<job_id>/download")
 def download_job_zip(job_id: str):
+    status = _available_status(job_id)
+    if status and status.get('storage') == 's3_pending':
+        return jsonify({'error': 'This result has not been committed to durable storage.'}), 409
+    record = _result_record(job_id)
+    if record:
+        return _stored_response(job_id, record['status']['zip_filename'], attachment=True)
     job_dir = RUNS_DIR / job_id
     if not job_dir.exists():
         abort(404)

@@ -1,0 +1,4 @@
+# Optional local experiment only; not installed by Dockerfile.apprunner.
+PyMuPDF>=1.28.2,<2
+numpy>=2,<3
+beautifulsoup4>=4.12.3,<5
