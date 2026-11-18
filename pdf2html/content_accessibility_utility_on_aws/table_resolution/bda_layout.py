@@ -1,7 +1,7 @@
 """Use verified local table geometry in the saved BDA layout representation."""
 from bs4 import BeautifulSoup
 
-from .article import glyphs, open_source, overlaps, resolve_article_tables
+from .article import glyphs, open_source, overlaps, resolve_article_tables, tagged_article_tables
 
 
 def apply_to_layout(doc, data):
@@ -12,7 +12,9 @@ def apply_to_layout(doc, data):
             blocks = page.get_text('dict', flags=0)['blocks']
             pdf_page = source.pages[index]
             try:
-                tables, _ = resolve_article_tables(pdf_page, page, blocks, [])
+                tagged, _ = tagged_article_tables(pdf_page, page, blocks)
+                inferred, _ = resolve_article_tables(pdf_page, page, blocks, tagged)
+                tables = tagged + inferred
             finally:
                 pdf_page.close()
             for table in tables:

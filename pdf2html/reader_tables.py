@@ -7,7 +7,7 @@ def contains(outer, inner, tolerance=1):
             and inner[2] <= outer[2] + tolerance and inner[3] <= outer[3] + tolerance)
 
 
-def extract_tables(page, blocks, render_line):
+def extract_tables(page, blocks, render_line, exclude=()):
     replacements, entries = [], []
     captions = [b for b in blocks if 'lines' in b and re.match(
         r'^Table\s+\d+\b', ' '.join(s['text'] for l in b['lines'] for s in l['spans']).strip(), re.I)]
@@ -18,6 +18,8 @@ def extract_tables(page, blocks, render_line):
     used_captions = set()
     for table in tables:
         box = table.bbox
+        if any(box[0] < b[2] and box[2] > b[0] and box[1] < b[3] and box[3] > b[1] for b in exclude):
+            continue
         reason = None
         rows = table.rows
         if len(rows) < 2 or table.col_count < 2 or any(
