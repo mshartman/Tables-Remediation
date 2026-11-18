@@ -90,9 +90,12 @@ def repair_tables(soup, article):
         if table.parent and 'reader-table' in table.parent.get('class', []):
             previous = table.parent.find_previous_sibling()
         if previous and previous.name == 'p' and re.match(r'^Table\s+\d+[.:\s]', previous.get_text(' ', strip=True), re.I):
+            old_caption_id = table.caption.get("id") if table.caption else None
             if table.caption:
                 table.caption.decompose()
             caption = soup.new_tag('caption')
+            if old_caption_id:
+                caption['id'] = old_caption_id
             for child in list(previous.contents):
                 caption.append(child.extract())
             previous.decompose()

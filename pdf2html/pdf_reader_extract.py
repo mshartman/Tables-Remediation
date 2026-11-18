@@ -1,5 +1,8 @@
 """Geometry-based local extraction; no model or cloud calls."""
 import base64
+from io import BytesIO
+import pdfplumber
+from content_accessibility_utility_on_aws.table_resolution.article import resolve_article_tables
 from collections import Counter
 from html import escape
 from pathlib import Path
@@ -238,7 +241,7 @@ def image_element(block, number):
 
 def extract_article(data, language='en', table_report=None, title=None, structure_report=None):
     sections = []
-    with pymupdf.open(stream=data, filetype='pdf') as doc:
+    with pymupdf.open(stream=data, filetype='pdf') as doc, pdfplumber.open(BytesIO(data)) as source:
         source_blocks = [page.get_text('dict')['blocks'] for page in doc]
         page_blocks = [[dict(block) for block in blocks] for blocks in source_blocks]
         scan_reports = []
@@ -274,6 +277,20 @@ def extract_article(data, language='en', table_report=None, title=None, structur
                         sizes[round(span['size'], 1)] += len(span['text'])
             body_size = sizes.most_common(1)[0][0] if sizes else 10
             tables, findings = extract_tables(page, blocks, line_html)
+            source_page = source.pages[number-1]
+            try:
+                resolved, extra_findings = resolve_article_tables(source_page, page, blocks, tables)
+            finally:
+                source_page.close()
+            removed_lines = {key for table in resolved for key in table['consumed']}
+            fallback_boxes = [t['bbox'] for t in tables]
+            tables.extend(dict(bbox=t['bbox'], table_html=t['html']) for t in resolved)
+            resolved_captions = {f['caption'] for f in extra_findings if 'caption' in f}
+            findings = [f for f in findings if not (
+                f.get('status') == 'needs_review' and
+                (f.get('caption') in resolved_captions or
+                 any('bbox' in f and contains(t['bbox'], f['bbox']) for t in resolved)))]
+            findings = extra_findings + findings
             if table_report is not None:
                 table_report.extend(dict(item, page=number) for item in findings)
             kept = []
@@ -281,7 +298,7 @@ def extract_article(data, language='en', table_report=None, title=None, structur
                 if block.get('table_caption_consumed'):
                     continue
                 if 'lines' in block:
-                    lines = [line for line in block['lines'] if not any(contains(t['bbox'], line['bbox']) for t in tables)]
+                    lines = [line for line in block['lines'] if id(line) not in removed_lines and not any(contains(box, line['bbox']) for box in fallback_boxes)]
                     if lines:
                         kept.append(dict(block, lines=lines))
                 else:

@@ -333,6 +333,11 @@ def convert_pdf_to_html(
                 for page_file in page_files:
                     logger.debug(f"  - {os.path.basename(page_file)}")
 
+            if options.get("resolve_local_tables", True):
+                from content_accessibility_utility_on_aws.table_resolution.document import resolve_document
+                resolve_document(pdf_path, html_dir, single_file=options["single_file"],
+                                 page_range=options.get("page_range"))
+
             # Add image-only status to the result
             result["is_image_only"] = is_image_only
 
