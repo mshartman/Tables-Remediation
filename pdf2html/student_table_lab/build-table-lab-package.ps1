@@ -31,6 +31,10 @@ foreach ($file in $files) {
     }
 }
 
+$utilityPackage = Join-Path $stagingPath "content_accessibility_utility_on_aws"
+New-Item -ItemType Directory -Path $utilityPackage -Force | Out-Null
+Copy-Item (Join-Path $projectRoot "content_accessibility_utility_on_aws/__init__.py") $utilityPackage
+Copy-Item (Join-Path $projectRoot "content_accessibility_utility_on_aws/table_resolution") $utilityPackage -Recurse
 $localStrategyPath = Join-Path $projectRoot "content_accessibility_utility_on_aws\remediate\remediation_strategies"
 Copy-Item -LiteralPath (Join-Path $localStrategyPath "local_table_extractor.py") -Destination $stagingPath -Force
 Copy-Item -LiteralPath (Join-Path $localStrategyPath "local_table_customization.py") -Destination $stagingPath -Force

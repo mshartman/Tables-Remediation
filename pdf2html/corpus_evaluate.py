@@ -24,6 +24,11 @@ ENGINE_FILES=('corpus_evaluate.py','layout_compare.py','layout_presentation.py',
               'experimental_layout/iris_layout.py','requirements-layout.txt')
 
 
+ENGINE_FILES = [*ENGINE_FILES, 'content_accessibility_utility_on_aws/__init__.py',
+                *(path.relative_to(ROOT).as_posix() for path in sorted(
+                    (ROOT / 'content_accessibility_utility_on_aws/table_resolution').glob('*.py')))]
+
+
 def selected_records(manifest):
     records=manifest['records'];sample=manifest['development_sample_sha256']
     dev={r['sha256'] for r in records if r['split']=='development'}

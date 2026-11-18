@@ -1,4 +1,6 @@
 """Offline comparison renderer; never invokes AWS or an image-description API."""
+from content_accessibility_utility_on_aws.table_resolution.article import open_source, resolve_article_tables
+
 import argparse
 import base64
 from html import escape
@@ -30,6 +32,11 @@ from layout_annotations import rotation_profile
 
 def geometry_structure(doc):
     """Adapt local heuristics to the renderer's element schema, not BDA output."""
+    with open_source(doc) as source:
+        return _geometry_structure(doc, source)
+
+
+def _geometry_structure(doc, source):
     blocks = [split_abstract(page.get_text('dict', flags=pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES)['blocks'])
               for page in doc]
     body_size = contextual_headings(blocks)
@@ -44,11 +51,19 @@ def geometry_structure(doc):
         if composite:
             composite_pages.append(dict(composite,page=pi+1))
         tables, findings = ruled_tables(page)
-        table_findings.extend(dict(item,page=pi+1) for item in findings)
+        source_page = source.pages[pi]
+        try:
+            resolved, extra_findings = resolve_article_tables(source_page, page, blocks[pi], tables)
+        finally:
+            source_page.close()
+        removed_lines = {key for table in resolved for key in table['consumed']}
+        fallback_boxes = [table['bbox'] for table in tables]
+        tables.extend(resolved)
+        table_findings.extend(dict(item,page=pi+1) for item in findings + extra_findings)
         for index, block in enumerate(ordered(blocks[pi], page.rect.width)):
             if not block.get('lines'):
                 continue
-            lines = [line for line in block['lines'] if not any(inside(line,t['bbox']) for t in tables)]
+            lines = [line for line in block['lines'] if id(line) not in removed_lines and not any(inside(line,box) for box in fallback_boxes)]
             if not lines:
                 continue
             block = dict(block,lines=lines,bbox=(min(l['bbox'][0] for l in lines),min(l['bbox'][1] for l in lines),
@@ -232,6 +247,8 @@ def compare(pdf, output, bda_json=None, remediated=None, geometry_only=False, ti
         data = geometry_structure(doc) if geometry_only else json.loads(Path(bda_json).read_text(encoding='utf-8-sig'))
         if not geometry_only:
             validate_structure(data, len(doc))
+            from content_accessibility_utility_on_aws.table_resolution.bda_layout import apply_to_layout
+            apply_to_layout(doc, data)
         structure = output / 'layout-structure.json'
         products = {structure, output / 'layout.html', output / 'layout-review.json'}
         if pdf in products or any(p and Path(p).resolve() in products for p in (bda_json, remediated)):
@@ -248,7 +265,7 @@ def compare(pdf, output, bda_json=None, remediated=None, geometry_only=False, ti
                       composite_text_pages=data.get('composite_text_pages',[]),
                       margin_note_pages=[{'page':i+1,'notes':item['notes']} for i,item in enumerate(rotations) if item['notes']],
                       fallback_pages=[{k:v for k,v in item.items() if k != 'text'} for item in fallbacks],
-                      limitations=['Human review required. Local table recovery supports only unambiguous ruled tables with sequential row IDs.',
+                      limitations=['Human review required. Table recovery depends on source text and geometry.',
                                    'Reading order, scientific content and image alternatives are not certified.'])
         finish_output(target, doc, report, fallbacks, geometry_only, title or pdf.stem)
         (output / 'layout-review.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
