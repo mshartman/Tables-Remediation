@@ -2,7 +2,7 @@
 import base64
 from io import BytesIO
 import pdfplumber
-from content_accessibility_utility_on_aws.table_resolution.article import resolve_article_tables
+from content_accessibility_utility_on_aws.table_resolution.article import resolve_article_tables, tagged_article_tables
 from collections import Counter
 from html import escape
 from pathlib import Path
@@ -260,10 +260,13 @@ def extract_article(data, language='en', table_report=None, title=None, structur
                     for span in line['spans']:
                         sizes[round(span['size'], 1)] += len(span['text'])
             body_size = sizes.most_common(1)[0][0] if sizes else 10
-            tables, findings = extract_tables(page, blocks, line_html)
             source_page = source.pages[number-1]
             try:
-                resolved, extra_findings = resolve_article_tables(source_page, page, blocks, tables)
+                tagged, tag_findings = tagged_article_tables(source_page, page, blocks)
+                tables, findings = extract_tables(page, blocks, line_html, [t['bbox'] for t in tagged])
+                resolved, extra_findings = resolve_article_tables(source_page, page, blocks, tables + tagged)
+                resolved = tagged + resolved
+                extra_findings = tag_findings + extra_findings
             finally:
                 source_page.close()
             removed_lines = {key for table in resolved for key in table['consumed']}

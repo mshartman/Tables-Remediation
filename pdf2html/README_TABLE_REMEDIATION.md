@@ -83,6 +83,13 @@ and column spans, header IDs and associations. Missing or ambiguous text require
   common identifier headings such as Gene and Compound. Set it explicitly for other conventions.
   A table continuing across pages is represented as one segment per page.
 
-Run `python -m unittest test_table_resolution test_reader_tables` from `pdf2html`.
+For single-page rectangular tables, the reader first checks the PDF structure tree.
+It resolves the marked content of each tagged cell and preserves its row order.
+A survey with consecutive Q identifiers retains all its data rows and uses the
+identifiers as HTML row headers. Missing, ambiguous or unsupported tags fall
+back to the existing detection paths. The article reader also checks the source
+lines before replacing them, keeping nearby prose and figures in place.
+
+Run `python -m unittest test_tagged_table_resolution test_table_resolution test_reader_tables` from `pdf2html`.
 The new tests use generated source documents and substitute a fixture for the remote BDA call.
 This integration produces HTML. The separate Adobe PDF-to-PDF workflow generates its own PDF tags.

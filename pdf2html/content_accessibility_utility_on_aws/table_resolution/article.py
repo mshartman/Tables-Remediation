@@ -9,6 +9,7 @@ import pdfplumber
 
 from .html_tables import table_html
 from .table_structure import detect_page
+from .tagged import tagged_tables
 
 
 def open_source(doc):
@@ -25,6 +26,57 @@ def glyphs(text):
 
 def line_text(line):
     return ''.join(span['text'] for span in line['spans'])
+
+
+def tagged_article_tables(source, page, blocks):
+    """Recover authored rows before trying grid heuristics on remaining regions."""
+    recovered, findings = [], []
+    if page.rotation or any(abs(a-b) > .1 for a, b in zip(source.bbox, page.rect)):
+        return recovered, findings
+    lines = [line for block in blocks for line in block.get('lines', [])]
+    for record in tagged_tables(source):
+        bbox = record['bbox']
+        if any(overlaps(bbox, image['bbox']) for image in page.get_image_info()):
+            continue
+        if any(overlaps(bbox, link['from']) for link in page.get_links()):
+            continue
+        local = [line for line in lines if overlaps(bbox, line['bbox'])]
+        tag = BeautifulSoup(record['html'], 'html.parser').table
+        if not attach_source_lines(tag, bbox, local, lines, recovered, record.get('caption_bbox')):
+            continue
+        findings.append(dict(page=page.number+1, status='structured_needs_review', method='tags',
+                             bbox=list(bbox), rows=record['rows'], columns=record['columns'],
+                             caption=tag.caption.get_text()))
+    return recovered, findings
+
+
+def attach_source_lines(tag, bbox, local, lines, recovered, caption_bbox=None):
+    """Consume exactly the lines represented in the HTML cells and one adjacent caption."""
+    if glyphs(''.join(line_text(line) for line in local)) != glyphs(
+            ''.join(cell.get_text() for cell in tag.select('th,td'))):
+        return False
+    box = list(bbox)
+    if caption_bbox:
+        caption_lines = [line for line in lines if overlaps(caption_bbox, line['bbox'])]
+        if glyphs(''.join(line_text(line) for line in caption_lines)) != glyphs(tag.caption.get_text()):
+            return False
+        box = [min(box[0], caption_bbox[0]), min(box[1], caption_bbox[1]),
+               max(box[2], caption_bbox[2]), max(box[3], caption_bbox[3])]
+        local.extend(caption_lines)
+    else:
+        caption_lines = [line for line in lines
+                         if 0 <= bbox[1] - line['bbox'][3] <= 15
+                         and bbox[0]-2 <= line['bbox'][0] <= bbox[0]+12
+                         and line['bbox'][2] <= bbox[2]+2
+                         and re.match(r'^Table\s+\d+\b', line_text(line).strip(), re.I)]
+        if len(caption_lines) == 1:
+            caption = caption_lines[0]
+            tag.caption.string = line_text(caption).strip()
+            box[1] = caption['bbox'][1]
+            local.append(caption)
+    tag['data-reader-headers-repaired'] = ''
+    recovered.append(dict(bbox=box, html=str(tag), consumed={id(line) for line in local}))
+    return True
 
 
 def resolve_article_tables(source, page, blocks, existing):
@@ -53,25 +105,11 @@ def resolve_article_tables(source, page, blocks, existing):
             findings.append(dict(status='needs_review', bbox=bbox, reason=str(error)))
             continue
         tag = BeautifulSoup(markup, 'html.parser').table
-        if glyphs(''.join(line_text(line) for line in local)) != glyphs(
-                ''.join(cell.get_text() for cell in tag.select('th,td'))):
+        tag['data-local-table'] = 'resolved'
+        if not attach_source_lines(tag, bbox, local, lines, recovered):
             findings.append(dict(status='needs_review', bbox=bbox,
                                  reason='Converted cells do not account for the source text.'))
             continue
-        caption_lines = [line for line in lines
-                         if 0 <= bbox[1] - line['bbox'][3] <= 15
-                         and bbox[0]-2 <= line['bbox'][0] <= bbox[0]+12
-                         and line['bbox'][2] <= bbox[2]+2
-                         and re.match(r'^Table\s+\d+\b', line_text(line).strip(), re.I)]
-        box = list(bbox)
-        if len(caption_lines) == 1:
-            caption = caption_lines[0]
-            tag.caption.string = line_text(caption).strip()
-            box[1] = caption['bbox'][1]
-            local.append(caption)
-        tag['data-local-table'] = 'resolved'
-        tag['data-reader-headers-repaired'] = ''
-        recovered.append(dict(bbox=box, html=str(tag), consumed={id(line) for line in local}))
         findings.append(dict(status='structured_needs_review', bbox=bbox,
                              method=table['method'], rows=table['row_count'],
                              columns=table['column_count'], caption=tag.caption.get_text()))

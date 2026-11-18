@@ -1,5 +1,5 @@
 """Offline comparison renderer; never invokes AWS or an image-description API."""
-from content_accessibility_utility_on_aws.table_resolution.article import open_source, resolve_article_tables
+from content_accessibility_utility_on_aws.table_resolution.article import open_source, overlaps, resolve_article_tables, tagged_article_tables
 
 import argparse
 import base64
@@ -53,7 +53,13 @@ def _geometry_structure(doc, source):
         tables, findings = ruled_tables(page)
         source_page = source.pages[pi]
         try:
-            resolved, extra_findings = resolve_article_tables(source_page, page, blocks[pi], tables)
+            tagged, tag_findings = tagged_article_tables(source_page, page, blocks[pi])
+            tables = [t for t in tables if not any(overlaps(t['bbox'], tag['bbox']) for tag in tagged)]
+            findings = [f for f in findings if not any(
+                f.get('caption') == tag.get('caption') for tag in tag_findings)]
+            resolved, extra_findings = resolve_article_tables(source_page, page, blocks[pi], tables + tagged)
+            resolved = tagged + resolved
+            extra_findings = tag_findings + extra_findings
         finally:
             source_page.close()
         removed_lines = {key for table in resolved for key in table['consumed']}
