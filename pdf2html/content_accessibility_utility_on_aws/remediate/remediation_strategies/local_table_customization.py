@@ -20,14 +20,8 @@ class LocalTableLabPolicy:
     # Prefer the visible grid drawn in many research-PDF tables. This prevents
     # pdfplumber from guessing columns from the text's horizontal positions.
     table_settings: dict | None = None
+    # None recognizes common identifier headings, including Gene and Compound.
+    first_column_is_row_header: bool | None = None
 
 
-LOCAL_TABLE_LAB_POLICY = LocalTableLabPolicy(
-    table_settings={
-        "vertical_strategy": "lines",
-        "horizontal_strategy": "lines",
-        "snap_tolerance": 4,
-        "join_tolerance": 4,
-        "intersection_tolerance": 4,
-    }
-)
+LOCAL_TABLE_LAB_POLICY = LocalTableLabPolicy()
