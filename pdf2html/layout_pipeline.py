@@ -21,6 +21,7 @@ def build_layout_preview(pdf_path, output_dir, legacy_html, conversion_result, t
             raise ValueError('No saved BDA structure is available. The original reader was retained.')
         target = compare(pdf_path, output_dir / 'layout',
                          bda_json=structure if mode == 'bda' else None,
+                         scan_bda_json=structure if mode == 'geometry' else None,
                          geometry_only=mode == 'geometry', remediated=legacy_html, title=title)
         refresh_layout_review(target)
         status.update(status='completed', preview='layout', filename='layout/layout.html')

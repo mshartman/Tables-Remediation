@@ -33,6 +33,7 @@ def audit_reader(html, table_findings=None):
                 add('broken_aria_reference', 'An accessible name or description references a missing ID.')
     images = soup.select('img')
     add('source_page_image_review', 'Page-image text layers and their figure alternatives require source review.',len(soup.select('[data-layout-scan-warning]')))
+    add('ocr_text_review', 'Existing OCR text, article boundaries and column order require comparison with the original scan.', len(soup.select('[data-reader-ocr-warning]')))
     add('source_margin_note_review', 'Rotated margin text was retained separately; verify its placement and meaning.',len(soup.select('.reader-margin-notes')))
     add('missing_image_alternative', 'Image alternatives are missing or placeholders.', sum(needs_description(img) for img in images))
     add('ai_alternative_review', 'AI-generated descriptions require human review.', sum(img.get('data-alt-status') == 'ai-generated' for img in images))

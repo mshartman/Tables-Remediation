@@ -41,6 +41,17 @@ class LayoutPipelineTests(unittest.TestCase):
         report = json.loads((self.root/'layout-status.json').read_text())
         self.assertEqual(report['status'], 'fallback')
 
+    def test_geometry_forwards_saved_bda_for_scanned_reading_text(self):
+        saved = self.root/'saved-bda.json'
+        with (patch.dict(os.environ, {'READER_LAYOUT_MODE': 'geometry'}),
+              patch('layout_compare.compare', return_value=self.legacy) as call,
+              patch.object(pipeline, 'refresh_layout_review')):
+            result = pipeline.build_layout_preview(self.pdf, self.root, self.legacy,
+                {'bda_layout_structure_path': str(saved)}, 'Sample')
+        self.assertEqual(result, self.legacy)
+        self.assertEqual(call.call_args.kwargs['scan_bda_json'], str(saved))
+        self.assertIsNone(call.call_args.kwargs['bda_json'])
+
     def test_renderer_failure_keeps_legacy_without_error_payload(self):
         with patch.dict(os.environ, {'READER_LAYOUT_MODE':'geometry'}), patch('layout_compare.compare',side_effect=RuntimeError('private payload')):
             self.assertIsNone(pipeline.build_layout_preview(self.pdf,self.root,self.legacy,{},'Sample'))

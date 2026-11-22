@@ -26,6 +26,10 @@ class ScanTests(unittest.TestCase):
         self.assertFalse(details.has_attr('open'))
         self.assertIsNotNone(details.img)
         self.assertIn('Readable source text', soup.select_one('.page > p').get_text())
+        self.assertIn('has not re-run OCR', soup.select_one('[data-reader-ocr-warning]').get_text())
+        from reader_audit import audit_reader
+        codes = [item['code'] for item in audit_reader(str(soup))['findings']]
+        self.assertIn('ocr_text_review', codes)
 
 
 if __name__ == '__main__':

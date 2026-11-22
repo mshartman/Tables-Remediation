@@ -31,6 +31,97 @@ request (`RESULTS_RETENTION_BASIS=first_conversion`). Reuse does not extend it.
 This is separate from the ILLiad PDF notice of 30 days from delivery. Integrate
 the real delivery date before selecting optional delivery-based retention.
 
+## Processing Limits And Failures
+
+The full service accepts documents of **1 to 100 pages**, including table-only
+uploads. The API rejects larger files with HTTP 422 before creating a job or
+starting paid processing. Its response explains the page count and asks the
+user to split the document into PDFs of 100 pages or fewer. Password-protected,
+empty and unreadable files receive a separate explanation. The existing ILLiad
+JavaScript displays the API's `error` string. The direct conversion API and BDA
+processing entry point enforce the same limit as defense in depth.
+
+`BDA_TIMEOUT_SECONDS` controls how long the worker polls an already-submitted BDA
+job. The default is **300 seconds** for compatibility; valid values are integers
+from **30 to 3600**. For example, set the plain-text App Runner environment
+variable to `900` to allow a 15-minute polling budget after deploying the updated
+image. Invalid settings fail before PDF upload/submission to BDA. This is a
+polling budget, not an AWS cancellation request; in-flight SDK calls may delay
+the final timeout. Longer waits occupy the service's single conversion worker
+for longer, and do not guarantee success for malformed documents.
+
+Timeouts retain their exception type, configured limit and last known status.
+`ClientError` and `ServiceError` BDA statuses fail immediately rather than waiting
+until the deadline. Transient status-request errors retry within the same budget;
+no new BDA invocation is automatically submitted. Changing this setting requires
+the updated image, but subsequent timeout changes need only the App Runner
+environment setting, not a code rebuild.
+
+Analytics emit controlled failure codes, readable reasons, stage, timeout and
+known AWS error codes. They never copy arbitrary exception messages, raw BDA
+error bodies, document filenames, credentials or traceback text into the usage
+dashboard. Detailed application diagnostics remain restricted operational logs.
+
+## AI Image Descriptions
+
+AI-generated image alternatives start with the literal phrase
+`AI generated alt text:` in the `alt` attribute so screen readers announce the
+disclosure. The same rule applies to OpenAI, Bedrock and optional campus model
+paths. Re-rendering also labels existing descriptions with `data-alt-status="ai-generated"`
+without duplicating the prefix. Authored descriptions, decorative empty
+alternatives and failure placeholders are not relabeled. Existing cached HTML
+is unchanged until regenerated or re-rendered with the updated application.
+
+## Selective Local Re-OCR
+
+New full-service conversions run a local OCR preflight **after the 100-page
+validation and before BDA**. Clean native text is retained. Scanned/hidden text
+layers are not assumed accurate simply because they contain selectable text;
+pages with no text, damaged character mappings, or excessive Latin word
+fragmentation are also candidates. This is a conservative quality heuristic,
+not a measurement of transcription accuracy, language correctness or WCAG compliance.
+
+Tesseract re-recognizes selected pages from a 300-dpi raster (capped at 24 million
+pixels per page). A candidate must have character-weighted word confidence of at least 85,
+no more than 15% low-confidence characters, and pass character/fragmentation
+checks. Major losses in text length are rejected; otherwise readable old text
+must retain at least 85% of its character count. These checks reduce risk but
+cannot prove that new wording or numbers are correct. Equations, handwriting,
+historical print, names and tables still need human review. Arbitrary non-Latin
+text is not treated as garbled merely for being non-ASCII.
+
+Accepted pages go into a **temporary working PDF**, used consistently by BDA,
+the reader and the layout renderer. The uploaded PDF stays untouched. Page
+count, dimensions, ordinary link destinations and simple bookmarks are
+preserved; selected pages become raster-backed OCR pages, so native font/tag
+structure, editable forms and annotation interactivity are not preserved on
+those working-copy pages. Their visible appearance is rendered into the image.
+Unselected pages retain their original content. Temporary files are removed
+after processing, including on failure, and are not added to the results ZIP.
+
+`ocr-quality.json` records page numbers, selection reasons, outcomes and confidence
+summaries, without document text or filenames. The HTML shows an OCR review
+notice, including the count of selected pages that could not be safely replaced.
+Missing engines, timeouts and rejected candidates keep the source layer rather
+than silently advertising successful OCR. Cached conversions are reused as
+before; this does not retroactively reprocess existing cached results.
+
+The App Runner image installs Tesseract and English language data. Settings:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PDF_OCR_MODE` | `auto` | Set `off` to disable the preflight. |
+| `PDF_OCR_LANGUAGE` | `eng` | Tesseract language(s), such as `eng+spa`; install additional language data in the image first. |
+| `PDF_OCR_PAGE_TIMEOUT_SECONDS` | `45` | Per-engine-call timeout, 5-300 seconds. |
+| `PDF_OCR_BUDGET_SECONDS` | `600` | Soft document OCR budget, 30-3600 seconds. Pending pages retain source text when exhausted. |
+
+The budget is checked between pages; raster rendering and saving may extend it.
+OCR runs one engine thread at a time. It makes no external OCR/model API calls,
+but it adds App Runner CPU time and queue latency; BDA still runs afterward and
+its normal charges remain. Native Windows runs need Tesseract on `PATH` and
+the PDF libraries from `requirements-layout.txt`. Rebuild/deploy the image to
+activate this in production. The standalone local Table Lab is unchanged.
+
 ## Build The Container
 
 From the `pdf2html` directory:

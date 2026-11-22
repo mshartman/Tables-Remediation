@@ -6,6 +6,7 @@ import re
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
+from content_accessibility_utility_on_aws.utils.alt_text import set_ai_alt
 
 ENDPOINT = 'https://chatgpt.microsopht.com/ollama/api/'
 
@@ -31,6 +32,7 @@ def annotate_image_gaps(soup, article):
             if not img.has_attr('alt'):
                 img['alt'] = 'Image description unavailable.'
         elif img.get('data-alt-status') == 'ai-generated':
+            set_ai_alt(img, img.get('alt', ''))
             generated += 1
     if missing or generated:
         notice = soup.new_tag('aside', attrs={
@@ -98,8 +100,7 @@ def describe_missing_images(html):
                 if not isinstance(text, str) or not 10 <= len(text.strip()) <= 1600:
                     raise ValueError('Invalid description')
                 cache[fingerprint] = ' '.join(text.split())
-            img['alt'] = cache[fingerprint]
-            img['data-alt-status'] = 'ai-generated'
+            set_ai_alt(img, cache[fingerprint])
             report['generated'] += 1
         except Exception:
             report['failed'] += 1

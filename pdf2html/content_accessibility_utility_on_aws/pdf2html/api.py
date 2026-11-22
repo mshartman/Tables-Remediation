@@ -24,6 +24,8 @@ from content_accessibility_utility_on_aws.pdf2html.services.bedrock_client impor
     resolve_bda_project,
 )
 from content_accessibility_utility_on_aws.pdf2html.utils.pdf_utils import is_image_only_pdf
+from content_accessibility_utility_on_aws.pdf2html.utils.pdf_validation import validate_pdf_pages
+from content_accessibility_utility_on_aws.utils.job_errors import BDAError, BDATimeoutError, PDFValidationError
 
 # Set up module-level logger
 logger = setup_logger(__name__)
@@ -190,6 +192,7 @@ def convert_pdf_to_html(
         # Verify PDF file exists
         if not os.path.isfile(pdf_path):
             raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+        validate_pdf_pages(pdf_path)
 
         # Open the PDF and check if it's image-only
         is_image_only = is_image_only_pdf(pdf_path)
@@ -371,6 +374,8 @@ def convert_pdf_to_html(
 
     except FileNotFoundError:
         # Re-raise FileNotFoundError directly
+        raise
+    except (BDAError, BDATimeoutError, PDFValidationError):
         raise
     except Exception as e:
         # Handle and transform other exceptions

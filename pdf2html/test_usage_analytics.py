@@ -163,6 +163,7 @@ class ServerAnalyticsTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.addCleanup(patch.stopall)
         patch.object(server, 'RUNS_DIR', self.root).start()
+        patch.object(server, 'validate_pdf_pages', return_value=4).start()
         patch.dict('os.environ', ACCESSIBLE_HTML_ANALYTICS_ENABLED='true', AWS_EC2_METADATA_DISABLED='true').start()
         patch.object(server.threading, 'Thread', ImmediateThread).start()
         patch.object(server.SessionUsageTracker, '_instance', None).start()

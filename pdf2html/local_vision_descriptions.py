@@ -6,6 +6,7 @@ from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
 from image_descriptions import needs_description
+from content_accessibility_utility_on_aws.utils.alt_text import set_ai_alt
 
 ENDPOINT = 'https://library.stonybrook.edu/LiteLLM/chat/completions'
 MODELS = {'local_qwen': 'ai11-qwen3.5-9b',
@@ -74,8 +75,7 @@ def describe_local(html, provider='local_qwen'):
                 text, usage = request_description(src, context, key, model)
                 cache[identity] = text
                 report['usage'].append(usage)
-            img['alt'] = cache[identity]
-            img['data-alt-status'] = 'ai-generated'
+            set_ai_alt(img, cache[identity])
             report['generated'] += 1
         except Exception:
             # No retries, remote error logging, or paid-provider fallback.

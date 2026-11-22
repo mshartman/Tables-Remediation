@@ -15,6 +15,7 @@ import time
 import boto3
 import tempfile
 import shutil
+from botocore.exceptions import BotoCoreError, ClientError, ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError
 from bs4 import BeautifulSoup
 from datetime import datetime
 
@@ -23,9 +24,54 @@ from content_accessibility_utility_on_aws.utils.logging_helper import (
 )
 from content_accessibility_utility_on_aws.utils.usage_tracker import SessionUsageTracker
 from content_accessibility_utility_on_aws.pdf2html.services.page_builder import build_html_data
+from content_accessibility_utility_on_aws.pdf2html.utils.pdf_validation import validate_pdf_pages
+from content_accessibility_utility_on_aws.utils.job_errors import BDAError, BDATimeoutError, aws_error_code
 
 # Set up module-level logger
 logger = setup_logger(__name__)
+
+
+def bda_timeout_seconds():
+    value = os.getenv('BDA_TIMEOUT_SECONDS', '300').strip()
+    if not 1 <= len(value) <= 4 or not value.isascii() or not value.isdecimal() or not 30 <= int(value) <= 3600:
+        raise BDAError('bda_configuration_invalid')
+    return int(value)
+
+
+def wait_for_bda(client, invocation_arn, seconds):
+    """Bound polling without submitting again, preserving real terminal failures."""
+    started = time.monotonic()
+    last_status, last_error = None, None
+    success = {'Succeeded', 'Success', 'COMPLETED', 'SUCCEEDED', 'Complete', 'Completed'}
+    failed = {'Failed', 'Failure', 'FAILED', 'ServiceError', 'ClientError'}
+    pending = {'Created', 'InProgress', 'Pending', 'Running', 'Queued'}
+    transient = {'ThrottlingException', 'TooManyRequestsException', 'InternalServerException',
+                 'InternalServerError', 'ServiceUnavailableException'}
+    while True:
+        if time.monotonic() - started >= seconds:
+            raise BDATimeoutError(seconds, last_status) from last_error
+        try:
+            result = client.get_data_automation_status(invocationArn=invocation_arn)
+        except (ClientError, BotoCoreError) as exc:
+            code = aws_error_code(exc)
+            if code not in transient and not isinstance(exc, (ConnectionClosedError, ConnectTimeoutError, EndpointConnectionError, ReadTimeoutError)):
+                raise BDAError('bda_status_poll_failed', last_status, code) from exc
+            last_error = exc
+            logger.warning('Transient BDA status request failure; retrying within the configured wait limit.')
+        else:
+            status = result.get('status') if isinstance(result, dict) else None
+            if not isinstance(status, str):
+                raise BDAError('bda_invalid_status')
+            if status in success:
+                return result
+            if status in failed:
+                raise BDAError('bda_job_failed', status)
+            if status not in pending:
+                raise BDAError('bda_invalid_status')
+            last_status = status
+        remaining = seconds - (time.monotonic() - started)
+        if remaining > 0:
+            time.sleep(min(5, remaining))
 
 
 # Update the function signature to accept profile parameter
@@ -300,6 +346,8 @@ class ExtendedBDAClient(BDAClient):
             dict: Processing results
         """
         start_time = datetime.now()
+        timeout_seconds = bda_timeout_seconds()
+        validate_pdf_pages(pdf_path)
         
         try:
             # Verify we have a bucket
@@ -384,10 +432,9 @@ class ExtendedBDAClient(BDAClient):
                 invocation_arn = response["invocationArn"]
                 poll_args = {"invocationArn": invocation_arn}
             else:
-                raise RuntimeError(f"No job identifier in BDA response: {response!r}")
+                raise BDAError('bda_missing_invocation')
 
             # 2) Poll until the job finishes
-            start = time.time()
             
             # Debug: List all available methods in the client
             available_methods = [method for method in dir(self.bda_runtime_client) if not method.startswith('_')]
@@ -396,42 +443,10 @@ class ExtendedBDAClient(BDAClient):
             # Based on AWS CLI and boto3 documentation, the correct method is get_data_automation_status
             # and it takes invocationArn as a parameter
             if "invocationArn" in poll_args:
-                try:
-                    # Use the correct method name from the boto3 client
-                    invocation_arn = poll_args["invocationArn"]
-                    
-                    while True:
-                        elapsed = time.time() - start
-                        if elapsed > 300:  # 5 minutes
-                            raise TimeoutError(f"BDA job timed out after {elapsed:.0f}s")
-                        
-                        try:
-                            # Use the correct method name and parameter
-                            result = self.bda_runtime_client.get_data_automation_status(
-                                invocationArn=invocation_arn
-                            )
-                            
-                            # Get status from the result
-                            status = result.get("status", "Unknown")
-                            logger.debug(f"Got status: {status}, result: {result}")
-                            
-                            # Check if the job is complete
-                            if status in ("Succeeded", "Success", "Failed", "Failure", "COMPLETED", "FAILED"):
-                                break
-                        except Exception as e:
-                            logger.warning(f"Error polling job status: {e}. Retrying...")
-                        
-                        time.sleep(5)
-                except Exception as e:
-                    logger.error(f"Error during job status polling: {e}")
-                    # Continue with processing even if polling fails
-                    result = {"status": "Unknown"}
-                    status = "Unknown"
+                result = wait_for_bda(self.bda_runtime_client, poll_args['invocationArn'], timeout_seconds)
+                status = result['status']
             else:
-                # If we don't have an invocationArn, we can't poll for status
-                logger.warning("No invocationArn found in response. Skipping job status polling.")
-                result = {"status": "Unknown"}
-                status = "Unknown"
+                raise BDAError('bda_missing_invocation')
 
             # Get the output path from the job status
             logger.debug(f"Job {invocation_arn} finished with status: {status}")

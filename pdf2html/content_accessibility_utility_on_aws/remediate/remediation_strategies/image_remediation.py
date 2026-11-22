@@ -13,6 +13,7 @@ import os
 import re
 
 from content_accessibility_utility_on_aws.utils.logging_helper import setup_logger
+from content_accessibility_utility_on_aws.utils.alt_text import set_ai_alt
 from content_accessibility_utility_on_aws.remediate.prompt_generators.alt_text_generator import (
     generate_alt_text,
 )
@@ -84,7 +85,7 @@ def remediate_missing_alt_text(
             alt_text = generate_alt_text(img, soup, bedrock_client)
 
             # Add alt attribute
-            img["alt"] = alt_text
+            set_ai_alt(img, alt_text)
             return f"Added AI-generated alt text to image: {alt_text}"
         except (AltTextGenerationError, FileNotFoundError) as e:
             logger.error(f"Failed to generate alt text: {e}")
@@ -162,7 +163,7 @@ def remediate_empty_alt_text(
                 alt_text = generate_alt_text(img, soup, bedrock_client)
 
                 # Add alt attribute
-                img["alt"] = alt_text
+                set_ai_alt(img, alt_text)
                 return (
                     f"Added AI-generated alt text to image with empty alt: {alt_text}"
                 )
@@ -400,7 +401,7 @@ def remediate_generic_alt_text(soup, issue, bedrock_client=None):
         if bedrock_client:
             alt_text = generate_alt_text(img, soup, bedrock_client)
             if alt_text:
-                img["alt"] = alt_text
+                set_ai_alt(img, alt_text)
                 return f"Added AI-generated alt text '{alt_text}' to replace generic '{current_alt}'"
     except Exception as e:
         logger.error(f"Error generating AI alt text: {e}")
@@ -474,7 +475,7 @@ def remediate_long_alt_text(
             alt_text = generate_alt_text(img, soup, bedrock_client)
 
             # Add alt attribute
-            img["alt"] = alt_text
+            set_ai_alt(img, alt_text)
             return f"Shortened long alt text to: {alt_text}"
 
     return None

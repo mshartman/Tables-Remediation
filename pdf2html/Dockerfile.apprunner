@@ -11,6 +11,11 @@ ENV OPENAI_ALT_MODEL=gpt-5-nano
 ENV OPENAI_ALT_DETAIL=high
 ENV OPENAI_ALT_MAX_IMAGES=4
 ENV READER_LAYOUT_MODE=legacy
+ENV BDA_TIMEOUT_SECONDS=300
+ENV PDF_OCR_MODE=auto
+ENV PDF_OCR_LANGUAGE=eng
+ENV PDF_OCR_PAGE_TIMEOUT_SECONDS=45
+ENV PDF_OCR_BUDGET_SECONDS=600
 ENV ACCESSIBLE_HTML_ANALYTICS_ENABLED=true
 ENV RESULTS_S3_ENABLED=false
 ENV RESULTS_RETENTION_BASIS=first_conversion
@@ -18,7 +23,7 @@ ENV RESULTS_RETENTION_BASIS=first_conversion
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends build-essential zlib1g-dev libjpeg-dev && \
+    apt-get install -y --no-install-recommends build-essential zlib1g-dev libjpeg-dev tesseract-ocr tesseract-ocr-eng && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements-layout.txt pyproject.toml ./
@@ -33,6 +38,8 @@ COPY reader_polish.py reader_audit.py ./
 COPY openai_descriptions.py ./
 COPY layout_pipeline.py layout_compare.py layout_presentation.py layout_structure.py layout_tables.py layout_raster.py layout_annotations.py pdf_reader_extract.py ./
 COPY reader_tables.py reader_frontmatter.py reader_structure.py reader_cleanup.py reader_figures.py ./
+COPY reader_columns.py layout_scan_reading.py ./
+COPY ocr_preflight.py ./
 COPY experimental_layout ./experimental_layout
 COPY README_LOCAL_SERVER.md ./
 

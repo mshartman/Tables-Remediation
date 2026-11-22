@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="demo-csrf" content="{{ csrf }}">
+  <title>Faculty Document Studio | Stony Brook University Libraries</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ url_for('static', filename='faculty.css') }}">
+  <script src="{{ url_for('static', filename='faculty.js') }}" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+<svg class="icon-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="i-book" viewBox="0 0 24 24"><path d="M12 5v16M3 3l9 2 9-2v16l-9 2-9-2z"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 15v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 2H5v20h14V7zm0 0v6h5M8 12h8m-8 4h8"/></symbol>
+  <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 2 3 6v6c0 5 9 10 9 10s9-5 9-10V6zM8 12l3 3 5-6"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></symbol>
+  <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 17v4h16v-4"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+  <symbol id="i-reader" viewBox="0 0 24 24"><circle cx="12" cy="4" r="2"/><path d="m3 8 9 2 9-2m-9 2v5m0 0-5 7m5-7 5 7"/></symbol>
+</svg>
+<header class="masthead">
+  <a class="brand" href="/" aria-label="Stony Brook University Libraries, Faculty Document Studio home">
+    <span class="brand-mark"><svg class="icon" aria-hidden="true"><use href="#i-book"/></svg></span>
+    <span><strong>STONY BROOK</strong><span>UNIVERSITY LIBRARIES</span></span>
+  </a>
+  <div class="masthead-right"><span>Teaching. Research. Access.</span><span class="demo-badge"><span></span> Local demo</span></div>
+</header>
+<nav class="site-nav" aria-label="Main navigation">
+  <div class="nav-inner"><a href="#upload-section" class="nav-active" aria-current="page">New document</a><a href="#document-list">Your documents <span class="nav-count" id="nav-count">0</span></a><a href="#how-it-works">How it works</a><a href="#about-demo" class="nav-about">About this preview <span aria-hidden="true">&nearr;</span></a></div>
+</nav>
+<main id="main-content" tabindex="-1">
+  <noscript><p>This upload demo requires JavaScript to submit files and display processing status. Enable JavaScript or contact the library for another way to request help.</p></noscript>
+  <section class="hero" aria-labelledby="page-title">
+    <div class="hero-copy"><p class="eyebrow">FACULTY DOCUMENT STUDIO</p><h1 id="page-title">More ways to read.<br>More room to <em>learn.</em></h1><p class="hero-description">Give your course readings and handouts a more flexible format. Start with a PDF. Create a structured HTML reading view for your students.</p><div class="hero-tags"><span><svg class="icon" aria-hidden="true"><use href="#i-reader"/></svg> Screen-reader friendly structure</span><span><svg class="icon" aria-hidden="true"><use href="#i-book"/></svg> Built for course materials</span></div></div>
+    <div class="hero-art" aria-hidden="true"><div class="paper paper-back"><span class="paper-lines"></span></div><div class="paper paper-front"><div class="paper-top"><span class="paper-format">PDF</span><span class="paper-dots">&bull; &bull; &bull;</span></div><div class="paper-heading"></div><div class="paper-heading short"></div><div class="paper-lines"></div><div class="paper-lines half"></div><div class="paper-block"></div></div><span class="transform-arrow"><svg class="icon"><use href="#i-arrow"/></svg></span><div class="reading-card"><span class="reading-icon"><svg class="icon"><use href="#i-reader"/></svg></span><span>One document.<br><strong>A more open reading experience.</strong></span><span class="reading-check"><svg class="icon"><use href="#i-check"/></svg></span></div></div>
+  </section>
+  <div class="workspace-grid">
+    <div class="workspace-main">
+      <section class="upload-card" id="upload-section" aria-labelledby="upload-heading">
+        <header class="card-heading"><div><p class="section-kicker">LET'S GET STARTED</p><h2 id="upload-heading">Add your document</h2></div><span class="format-badge">PDF <span aria-hidden="true">&rarr;</span> HTML</span></header>
+        <form id="upload-form" novalidate>
+          <div class="form-error" id="form-error" role="alert" hidden></div>
+          <div class="drop-zone" id="drop-zone">
+            <span class="upload-icon"><svg class="icon" aria-hidden="true"><use href="#i-upload"/></svg></span>
+            <p class="drop-title">A better reading experience starts here</p><p class="drop-description">Drag and drop your PDF, or choose a file below.</p>
+            <span class="file-control"><label for="pdf-file">Choose a PDF <span aria-hidden="true">&nearr;</span></label><input type="file" id="pdf-file" name="pdf_file" accept=".pdf,application/pdf" aria-describedby="file-help file-selection" required></span>
+            <p class="file-help" id="file-help">PDF only &middot; Up to 20 MB &middot; 80 pages maximum</p>
+          </div>
+          <div class="selected-file" id="selected-file" hidden><span class="file-type-icon"><svg class="icon" aria-hidden="true"><use href="#i-file"/></svg></span><div><strong id="selected-name"></strong><span id="selected-size"></span></div><button type="button" class="icon-button" id="remove-file" aria-label="Remove selected PDF"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button></div>
+          <p id="file-selection" class="sr-only" role="status" aria-live="polite"></p>
+          <div class="sample-row"><span>Just exploring?</span> <button type="button" class="text-button" id="sample-button">Try a sample document <span aria-hidden="true">&rarr;</span></button></div>
+          <div class="title-field"><label for="document-title">Document title <span>(optional)</span></label><input type="text" id="document-title" name="title" maxlength="160" placeholder="e.g., Introduction to environmental studies" aria-describedby="title-help"><p id="title-help">Give the reading view a clear title. Otherwise, we'll use your filename.</p></div>
+          <div class="consent-block"><input type="checkbox" id="consent" required aria-describedby="consent-help"><label for="consent">I have permission to process this document and understand that the result needs human review.</label><p id="consent-help">Use a non-sensitive teaching document. Do not upload student records, confidential information, or restricted research.</p></div>
+          <div class="submit-row"><button type="submit" class="button button-primary" id="submit-button">Create reading view <svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></button><span class="submit-note">HTML output. Not a remediated PDF.</span></div>
+        </form>
+        <section class="processing-panel" id="processing-panel" aria-labelledby="processing-heading" hidden><div class="processing-top"><span class="processing-symbol" id="processing-symbol"><svg class="icon" aria-hidden="true"><use href="#i-file"/></svg></span><div><p class="section-kicker">YOUR DOCUMENT</p><h3 id="processing-heading" tabindex="-1">Creating your reading view</h3><p id="processing-filename"></p></div></div><ol class="progress-steps" id="progress-steps"><li data-phase="extracting"><span class="step-dot">1</span><div><strong>Read the source</strong><span>Extract text and document elements</span></div></li><li data-phase="structuring"><span class="step-dot">2</span><div><strong>Build the reading view</strong><span>Organize headings, links, and pages</span></div></li><li data-phase="checking"><span class="step-dot">3</span><div><strong>Check the structure</strong><span>Flag items for your review</span></div></li></ol><p id="processing-status" role="status" aria-live="polite"></p><div class="result-summary" id="result-summary" hidden></div><p class="review-reminder" id="review-reminder" hidden>Before sharing: compare the reading order and content with your PDF, review figures and tables, and test with assistive technology.</p><div class="result-actions" id="result-actions" hidden><a class="button button-primary" id="open-result" target="_blank" rel="noopener">Open reading view <span class="sr-only">in a new tab</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></a><a class="button button-secondary" id="download-result">Download HTML <svg class="icon" aria-hidden="true"><use href="#i-download"/></svg></a><a class="text-button" id="download-report">Download review notes</a></div><button type="button" class="text-button another-button" id="another-button" hidden>Start another document <span aria-hidden="true">&rarr;</span></button></section>
+      </section>
+      <section class="documents-section" id="document-list" aria-labelledby="documents-heading"><div class="documents-heading"><h2 id="documents-heading">Your documents</h2><span class="session-label">THIS LOCAL SESSION</span></div><div id="documents-empty" class="empty-documents"><svg class="icon" aria-hidden="true"><use href="#i-file"/></svg><div><h3>A fresh start.</h3><p>Your processed documents will appear here. Try the sample to see the full workflow.</p></div></div><ul class="document-items" id="document-items" aria-label="Your submitted documents"></ul></section>
+    </div>
+    <aside class="workspace-aside" aria-label="Processing information">
+      <section class="how-card" id="how-it-works" aria-labelledby="how-heading"><p class="section-kicker">A DIFFERENT WAY TO READ</p><h2 id="how-heading">From PDF<br>to possibility.</h2><p>An alternate format can make the same material easier to navigate, enlarge, and read with assistive technology.</p><ol class="how-steps"><li><span>01</span><div><h3>Bring your material</h3><p>A reading, handout, or course document you have permission to process.</p></div></li><li><span>02</span><div><h3>Create a reading view</h3><p>Text and basic document structure become a responsive HTML page.</p></div></li><li><span>03</span><div><h3>Review, then share</h3><p>Check the output against the source before providing it to students.</p></div></li></ol><div class="human-note"><svg class="icon" aria-hidden="true"><use href="#i-reader"/></svg><p>Automation helps.<br><strong>Your review makes the difference.</strong></p></div></section>
+      <section class="privacy-card"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><div><h2>A local preview.<br>Not a cloud upload.</h2><p>This demo processes files on this computer. No documents are sent to AWS or an AI service.</p><a href="#about-demo">What this demo does <span aria-hidden="true">&rarr;</span></a></div></section>
+      <div class="help-note"><p>Have a question?</p><a href="mailto:ill@stonybrook.edu">Contact Interlibrary Loan <span aria-hidden="true">&nearr;</span></a></div>
+    </aside>
+  </div>
+  <details class="about-demo" id="about-demo"><summary>About this demo &amp; accessibility review</summary><div><p>This is a local faculty-upload concept, not a live university service. It uses our existing local PDF extractor and static HTML checks. It does not use AI, perform OCR, certify WCAG compliance, or create a tagged PDF. Scans, equations, reading order, complex tables, and image descriptions may need substantial work.</p><p>Outputs stay in the local demo folder until manually removed. This session's links require this browser's demo cookie and stop working after the demo server restarts. There is no campus sign-in, email delivery, or public sharing. Do not expose this demonstration server to the internet.</p></div></details>
+</main>
+<footer class="site-footer"><div><strong>Access is part of the assignment.</strong><span>Stony Brook University Libraries &middot; Faculty Document Studio</span></div><span class="footer-demo">DEMONSTRATION ONLY</span></footer>
+</body>
+</html>

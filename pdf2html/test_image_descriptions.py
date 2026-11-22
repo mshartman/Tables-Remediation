@@ -15,6 +15,7 @@ class ImageDescriptionTests(unittest.TestCase):
         self.assertIn('1 image description(s)', soup.aside.get_text())
         self.assertEqual(soup.find_all('img')[1]['alt'], '')
         self.assertEqual(soup.find_all('img')[2]['alt'], 'An authored description')
+        self.assertEqual(soup.find_all('img')[4]['alt'], 'AI generated alt text: A diagram')
 
     @patch.dict('os.environ', {'OLLAMA_API_KEY': '', 'OLLAMA_VISION_MODEL': ''})
     def test_unconfigured_reports_remaining_without_network(self):
@@ -35,6 +36,7 @@ class ImageDescriptionTests(unittest.TestCase):
         images = BeautifulSoup(html, 'html.parser').find_all('img')
         self.assertEqual(images[0]['alt'], 'Existing description')
         self.assertEqual(images[1]['alt'], '')
+        self.assertEqual(images[2]['alt'], 'AI generated alt text: A diagram with two connected stages.')
         self.assertEqual(report['generated'], 1)
         self.assertEqual(client.call_count, 2)
 

@@ -70,6 +70,25 @@ storage remains ephemeral. Redeployment can remove existing jobs/results.
 The image installs only screen-rendering dependencies. PrinceXML, font bundles,
 Lambda deployment scripts and the IRIS notifier are not included.
 
+## Scan-backed reading text
+
+The production article renderer now prefers saved BDA transcription and headings
+on scan-backed pages, including when `READER_LAYOUT_MODE=geometry`. This avoids
+discarding better BDA text in favor of a degraded embedded OCR layer. Source
+Page view rendering remains unchanged. Column-aware recovery and provisional
+article grouping are documented in `SCANNED_NEWSPAPERS.md`; all require review.
+
+For offline reproduction with an existing completed job's files:
+
+```powershell
+python layout_compare.py "source.pdf" --geometry-only --scan-bda-json "bda-layout-structure.json" --remediated "remediated.html" --output "local_runs/scan-check"
+python -m unittest test_layout_scan_reading test_layout_pipeline test_layout_raster -v
+```
+
+This command reuses saved data and does not call AWS or a model. The App Runner
+caller passes the saved BDA structure automatically. Existing stored/cached jobs
+do not update just because the image was deployed.
+
 ## Reader presentation corrections
 
 Navigation labels come only from semantic text, not the duplicated visual layer.

@@ -14,6 +14,7 @@ from reader_frontmatter import group_frontmatter
 from reader_structure import record_page, record_render_blocks
 from reader_cleanup import prepare_cleanup, join_lines
 from reader_figures import figure_groups
+from reader_columns import recover_scan_columns, scan_order, scan_headings
 
 
 def line_html(line):
@@ -238,12 +239,27 @@ def image_element(block, number):
 def extract_article(data, language='en', table_report=None, title=None, structure_report=None):
     sections = []
     with pymupdf.open(stream=data, filetype='pdf') as doc:
-        page_blocks = [page.get_text('dict')['blocks'] for page in doc]
-        contextual_headings(page_blocks)
+        source_blocks = [page.get_text('dict')['blocks'] for page in doc]
+        page_blocks = [[dict(block) for block in blocks] for blocks in source_blocks]
+        scan_reports = []
+        for index, page in enumerate(doc):
+            blocks = page_blocks[index]
+            has_scan = any(is_duplicate_scan(b, blocks, page.rect) for b in blocks)
+            report = {'scan_backed': has_scan}
+            if has_scan:
+                page_blocks[index], recovered = recover_scan_columns(blocks, page.rect.width)
+                report.update(recovered)
+            scan_reports.append(report)
+        body_size = contextual_headings(page_blocks)
+        for index, page in enumerate(doc):
+            if scan_reports[index]['scan_backed']:
+                scan_headings(page_blocks[index], body_size, page.rect.height)
         if structure_report is not None:
             structure_report.update(schema_version=1, status='extracted',
                                     scope='Source geometry and heuristic render order; not verified semantics.',
-                                    pages=[record_page(page, page_blocks[i], i + 1) for i, page in enumerate(doc)])
+                                    pages=[record_page(page, source_blocks[i], i + 1) for i, page in enumerate(doc)])
+            for page_record, scan_report in zip(structure_report['pages'], scan_reports):
+                page_record['scan_review'] = scan_report
         retained, cleanup_changes = prepare_cleanup(page_blocks, [p.rect.height for p in doc])
         if structure_report is not None:
             structure_report['cleanup_changes'] = cleanup_changes
@@ -272,9 +288,21 @@ def extract_article(data, language='en', table_report=None, title=None, structur
                     kept.append(block)
             output = []
             scans = []
+            if scan_reports[number - 1]['scan_backed']:
+                output.append('<aside data-reader-ocr-warning="" aria-label="Scanned text review">'
+                              '<p>This page uses an existing OCR text layer. Recognition errors, missing '
+                              'headlines, and uncertain column or article order may remain. This conversion '
+                              'has not re-run OCR or corrected the wording. Compare it with the original '
+                              'scan available at the end of this page.</p></aside>')
             if findings:
                 output.append('<p class="table-review-notice">Table accessibility: this page contains detected tables or table captions that need human review. Unresolved table content remains in the extracted text and may not preserve cell relationships.</p>')
-            render_blocks = ordered(kept + tables, page.rect.width)
+            scan_blocks = [b for b in kept if is_duplicate_scan(b, blocks, page.rect)]
+            if scan_reports[number - 1].get('method') == 'ocr_line_gutters':
+                scan_ids = {id(b) for b in scan_blocks}
+                render_blocks = scan_order([b for b in kept if id(b) not in scan_ids] + tables,
+                                           scan_reports[number - 1]['gutters']) + scan_blocks
+            else:
+                render_blocks = ordered(kept + tables, page.rect.width)
             groups, consumed, figure_findings = figure_groups(render_blocks, page.rect.height)
             if structure_report is not None:
                 record_render_blocks(structure_report['pages'][number - 1], render_blocks)

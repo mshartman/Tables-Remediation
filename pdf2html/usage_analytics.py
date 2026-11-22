@@ -10,6 +10,9 @@ import sys
 import threading
 import time
 import uuid
+from content_accessibility_utility_on_aws.utils.job_errors import (
+    AWS_ERROR_CODES, BDA_STATUSES, FAILURE_MESSAGES, failure_details, failure_message,
+)
 
 
 MARKER = 'pdf2html_usage'
@@ -22,6 +25,10 @@ ENUMS = {
     'html_kind': {'selected_preview', 'legacy_preview', 'other_html'},
     'document_scope': {'illiad_delivery', 'job'},
     'cost_coverage': {'partial', 'unavailable'},
+    'error_code': set(FAILURE_MESSAGES),
+    'error_stage': {'bda', 'upload', 'processing'},
+    'bda_last_status': BDA_STATUSES,
+    'aws_error_code': AWS_ERROR_CODES,
 }
 CONTEXT_FIELDS = {'browser_id', 'document_id', 'document_scope'}
 COST_FIELDS = {'estimated_reported_ai_cost_usd', 'cost_coverage'}
@@ -37,7 +44,8 @@ EVENT_FIELDS = {
     'job_queued': {'channel', 'workflow'},
     'job_started': {'channel', 'workflow', 'queue_ms'},
     'job_completed': JOB_FIELDS | {'issues_found', 'issues_remediated'},
-    'job_failed': JOB_FIELDS | {'error_category'},
+    'job_failed': JOB_FIELDS | {'error_category', 'error_code', 'error_stage', 'error_message',
+                               'bda_timeout_seconds', 'bda_last_status', 'aws_error_code'},
     'job_cache_hit': {'channel', 'workflow', 'cache_state'},
     'html_response': {'html_kind', 'http_status'},
     'zip_response': {'http_status'},
@@ -90,6 +98,8 @@ def record_event(event, **fields):
                     payload[name] = value
             elif type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 10**12:
                 payload[name] = value
+        if event == 'job_failed' and payload.get('error_code') in FAILURE_MESSAGES:
+            payload['error_message'] = failure_message(payload)
         line = json.dumps(payload, separators=(',', ':'), allow_nan=False)
         with OUTPUT_LOCK:
             sys.stdout.write(line + '\n')
@@ -208,7 +218,4 @@ class JobTimer:
         self._finish('job_completed', **counts)
 
     def fail(self, error):
-        category = ('timeout' if isinstance(error, TimeoutError) else
-                    'storage_error' if isinstance(error, OSError) else
-                    'validation_error' if isinstance(error, ValueError) else 'processing_error')
-        self._finish('job_failed', error_category=category)
+        self._finish('job_failed', **failure_details(error))

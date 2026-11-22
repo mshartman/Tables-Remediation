@@ -7,6 +7,7 @@ from urllib.parse import urlsplit, unquote
 from urllib.request import Request, urlopen
 from bs4 import BeautifulSoup
 from image_descriptions import needs_description
+from content_accessibility_utility_on_aws.utils.alt_text import set_ai_alt
 
 
 def request_description(src, caption, key):
@@ -92,8 +93,7 @@ def describe_openai(html, image_root=None, asset_base=None):
                 description, usage = request_description(src, context, key)
                 cache[identity] = description
                 report['usage'].append(usage)
-            img['alt'] = cache[identity]
-            img['data-alt-status'] = 'ai-generated'
+            set_ai_alt(img, cache[identity])
             report['generated'] += 1
         except Exception:
             # Never log credentials, image payloads or remote error bodies. No retries.

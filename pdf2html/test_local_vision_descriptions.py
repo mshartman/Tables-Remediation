@@ -38,6 +38,8 @@ class LocalVisionTests(unittest.TestCase):
         self.assertEqual(report['remaining'], 3)
         self.assertEqual(call.call_args.args[3], 'ai11-llava-llama3-8b')
         self.assertEqual(BeautifulSoup(output, 'html.parser').img['alt'], 'authored')
+        self.assertEqual(BeautifulSoup(output, 'html.parser').find_all('img')[2]['alt'],
+                         'AI generated alt text: Two connected boxes.')
 
     @patch.dict('os.environ', {'LITELLM_API_KEY': 'test-only'})
     def test_failure_stops_without_fallback(self):

@@ -1,0 +1,2 @@
+# PDF cross-reference offsets are byte-based; never rewrite newlines on checkout.
+examples/headerless-table/*.pdf binary

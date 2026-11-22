@@ -1,5 +1,65 @@
 # Usage analytics for LIVEFROMNEWYORK
 
+## Private dashboard: everyday usage
+
+Use [PDFtoHTML-Usage in CloudWatch](https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#dashboards/dashboard/PDFtoHTML-Usage)
+after the one-time setup below. AWS sign-in is required. Do not publish/share the
+dashboard publicly or put its results in the I: web folder. It includes private
+browser/document pseudonyms.
+
+The dashboard defaults to the last 7 days, including testing activity in that
+window. Narrow it to launch dates for production reporting. Change the time range at the top and
+refresh when needed; no manual queries or container rebuild are needed. It shows
+completed conversions, failures, captured pages processed, successful HTML
+deliveries, cache reuse, per-PDF and per-browser usage, performance, data coverage,
+partial AI estimates, and existing AWS Billing metrics. Daily buckets use UTC.
+
+One-time installation, from this project directory after `aws login`:
+
+```powershell
+.\setup-usage-dashboard.ps1
+```
+
+Or use `python usage_dashboard.py install --verify-queries` to validate all ten
+queries once over the last 48 hours before publishing. Query validation and
+dashboard loads/refreshes can incur CloudWatch charges. Avoid frequent automatic
+refreshes and unnecessarily broad time ranges. No Lambda, custom metric publisher,
+database, public analytics endpoint or paid-model call is added.
+
+Setup discovers the application log group, checks the AWS account (default
+900119715649), creates only the dashboard, and checks the saved definition. It
+does not change App Runner, the website, IAM, billing preferences or log retention.
+It refuses to replace an existing dashboard unless `--replace` is supplied; that
+option saves a backup first. Keep generated definitions, private query checks and
+backups under ignored `local_runs/analytics/`. Offline generator tests:
+`python -m unittest test_usage_dashboard`.
+
+### Interpret costs correctly
+
+Per-PDF AI amounts require `ANALYTICS_RATES_JSON` and captured provider usage.
+Unpriced jobs show **Unavailable**, not zero. Configuring rates affects future
+events only; existing events are not backfilled. Even priced amounts are partial,
+not total service costs. See the rate configuration below. The coverage panel
+shows jobs with page/cost data and deliveries with correlation IDs.
+
+AWS Billing panels show the latest cumulative month-to-date **account-wide
+estimated** charges within the selected range, not a sum for that date range,
+not per-PDF costs, and not a final invoice. They do not include OpenAI charges.
+Billing metrics are read in us-east-1 using Maximum, never summed over time.
+Blank billing data means unavailable. To populate it, an authorized operator can
+enable **Receive CloudWatch Billing Alerts** in Billing > Billing preferences >
+Alert preferences, then wait about 15 minutes. AWS says this collection cannot
+be disabled after enabling it. Setup deliberately does not enable that setting
+or create alarms. Keep using Billing/Cost Explorer and OpenAI billing to reconcile
+the actual service bills.
+
+The dashboard reports recorded events, not event-ID-deduplicated audit totals.
+Repeated requests count as deliveries; browser IDs are not verified people.
+Per-PDF IDs group an ILLiad delivery, or a job if no transaction is available,
+not all copies of the same article. No identifiers or events before deployment
+are reconstructed. Use the private local export utility below for exact event-ID
+deduplication of an exported sample.
+
 ## What is captured
 
 The service emits small JSON events to standard output. App Runner sends
@@ -129,6 +189,25 @@ filter analytics = "pdf2html_usage" and event = "html_response"
 ```
 
 ### Failures and cache reuse
+
+New `job_failed` events include an allowlisted `error_code`, `error_stage` and a
+generated, readable `error_message`. BDA timeouts also record
+`bda_timeout_seconds` and the known `bda_last_status`; known AWS error codes can
+be included as `aws_error_code`. Causes are followed through exception wrappers,
+so a timeout remains classified as `timeout` instead of a generic processing
+error. These messages are generated from safe codes and values, never copied
+from arbitrary exception strings or provider response bodies.
+
+The dashboard has a recent-failures table with the reason, time, processing
+duration, private document pseudonym, event reference and application log stream.
+Older analytics events are not rewritten: their missing reason is explicitly
+marked as a legacy event. A separate legacy-BDA-timeout widget parses only the
+fixed timeout phrase and numeric seconds from operational logs. It consolidates
+duplicate log lines within each second/stream/limit; it does not infer a job or
+document association, and does not display raw messages or filenames.
+
+Oversized PDFs are rejected before a job is queued and count as submission
+errors, not failed conversions. The page limit is 100 pages per document.
 
 ```text
 filter analytics = "pdf2html_usage" and event = "job_failed"

@@ -181,6 +181,7 @@ class S3RouteTests(TestCase):
         patch.dict('os.environ', RESULTS_RETENTION_BASIS='first_conversion',
                    ACCESSIBLE_HTML_ANALYTICS_ENABLED='false', AWS_EC2_METADATA_DISABLED='true').start()
         patch.object(server.threading, 'Thread', analytics_tests.ImmediateThread).start()
+        patch.object(server, 'validate_pdf_pages', return_value=4).start()
         patch.object(server, '_analytics_usage', return_value={}).start()
         self.pipeline = patch.object(server, '_run_pipeline', side_effect=lambda **kw: analytics_tests.ServerAnalyticsTests.fake_pipeline(self, **kw)).start()
         patch('socket.create_connection', side_effect=AssertionError('Network forbidden')).start()

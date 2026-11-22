@@ -36,6 +36,8 @@ class OpenAITests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(report['generated'], 1)
         self.assertEqual(report['remaining'], 1)
+        self.assertEqual(BeautifulSoup(html, 'html.parser').img['alt'],
+                         'AI generated alt text: A chart showing two groups.')
 
     @patch.dict('os.environ', {'OPENAI_API_KEY': ''})
     def test_missing_key_never_calls(self):

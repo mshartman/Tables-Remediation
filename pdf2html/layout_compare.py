@@ -26,6 +26,7 @@ from layout_structure import refine_headings, split_abstract, split_leading_head
 from layout_tables import ruled_tables, inside
 from layout_raster import page_image_text_layer
 from layout_annotations import rotation_profile
+from layout_scan_reading import recover_scan_reading
 
 
 def geometry_structure(doc):
@@ -140,7 +141,7 @@ def fallback_pages(doc, data, rotations=None):
     return findings
 
 
-def finish_output(path, doc, report, fallbacks, geometry_only, title):
+def finish_output(path, doc, report, fallbacks, geometry_only, title, scan_bda=None, remediated=None):
     soup = BeautifulSoup(path.read_text(encoding='utf-8'), 'html.parser')
     if title:
         soup.title.string = title
@@ -194,6 +195,7 @@ def finish_output(path, doc, report, fallbacks, geometry_only, title):
         warning=soup.new_tag('aside',attrs={'data-layout-scan-warning':'','aria-label':'Text-layer review notice'})
         warning.string='Some pages contain a full-page image and an unverified text layer. The text is available in Reading view; OCR accuracy and any figures still require review.'
         soup.select_one('main').insert(0,warning)
+    report['scan_reading_recovery'] = recover_scan_reading(soup, doc, iris_layout, scan_bda, report, remediated)
     # Source table markup must not retain active content or arbitrary protocols.
     for node in soup.select('script, iframe, object, embed, form, base, link, meta[http-equiv]'):
         node.decompose()
@@ -217,7 +219,7 @@ def finish_output(path, doc, report, fallbacks, geometry_only, title):
     report['static_audit'] = audit_reader(output,table_findings=report.get('local_table_findings'))
 
 
-def compare(pdf, output, bda_json=None, remediated=None, geometry_only=False, title=None):
+def compare(pdf, output, bda_json=None, remediated=None, geometry_only=False, title=None, scan_bda_json=None):
     if iris_layout is None:
         raise RuntimeError('The optional page-layout renderer is private and is not included in this repository. Use the legacy reader or obtain an authorized private copy.')
     pdf, output = Path(pdf).resolve(), Path(output).resolve()
@@ -232,9 +234,21 @@ def compare(pdf, output, bda_json=None, remediated=None, geometry_only=False, ti
         data = geometry_structure(doc) if geometry_only else json.loads(Path(bda_json).read_text(encoding='utf-8-sig'))
         if not geometry_only:
             validate_structure(data, len(doc))
+            data.setdefault('composite_text_pages', [dict(scan, page=i+1)
+                            for i, page in enumerate(doc) if (scan := page_image_text_layer(page))])
+        scan_bda = data if not geometry_only else None
+        scan_bda_status = 'using_primary_structure' if not geometry_only else 'not_supplied'
+        if geometry_only and scan_bda_json:
+            try:
+                scan_bda = json.loads(Path(scan_bda_json).read_text(encoding='utf-8-sig'))
+                validate_structure(scan_bda, len(doc))
+                scan_bda_status = 'available'
+            except (OSError, ValueError, TypeError, KeyError):
+                scan_bda = None
+                scan_bda_status = 'invalid_or_unavailable_geometry_retained'
         structure = output / 'layout-structure.json'
         products = {structure, output / 'layout.html', output / 'layout-review.json'}
-        if pdf in products or any(p and Path(p).resolve() in products for p in (bda_json, remediated)):
+        if pdf in products or any(p and Path(p).resolve() in products for p in (bda_json, remediated, scan_bda_json)):
             raise ValueError('Output must not overwrite a supplied input file.')
         structure.write_text(json.dumps(data, indent=2), encoding='utf-8')
         rotations=[rotation_profile(page) for page in doc]
@@ -243,6 +257,7 @@ def compare(pdf, output, bda_json=None, remediated=None, geometry_only=False, ti
         report = iris_layout.build(str(pdf), str(structure), str(target),
                                    str(remediated) if remediated else None, dpi=110, bg_dpi=110)
         report.update(structure_source='local_geometry' if geometry_only else 'saved_bda',
+                      scan_bda_status=scan_bda_status,
                       network_calls=0, source=str(pdf),
                       local_table_findings=data.get('local_table_findings',[]),
                       composite_text_pages=data.get('composite_text_pages',[]),
@@ -250,7 +265,8 @@ def compare(pdf, output, bda_json=None, remediated=None, geometry_only=False, ti
                       fallback_pages=[{k:v for k,v in item.items() if k != 'text'} for item in fallbacks],
                       limitations=['Human review required. Local table recovery supports only unambiguous ruled tables with sequential row IDs.',
                                    'Reading order, scientific content and image alternatives are not certified.'])
-        finish_output(target, doc, report, fallbacks, geometry_only, title or pdf.stem)
+        remediated_text = Path(remediated).read_text(encoding='utf-8') if remediated else None
+        finish_output(target, doc, report, fallbacks, geometry_only, title or pdf.stem, scan_bda, remediated_text)
         (output / 'layout-review.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     return target
 
@@ -263,6 +279,7 @@ def main():
     group.add_argument('--bda-json', type=Path)
     group.add_argument('--geometry-only', action='store_true')
     parser.add_argument('--remediated', type=Path)
+    parser.add_argument('--scan-bda-json', type=Path, help='Reuse saved BDA transcription on scanned pages while retaining geometry Page view.')
     parser.add_argument('--title')
     args = parser.parse_args()
     try:

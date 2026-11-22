@@ -35,6 +35,8 @@ from content_accessibility_utility_on_aws.remediate.remediation_strategies.local
     extract_pdf_tables_to_html,
 )
 from content_accessibility_utility_on_aws.utils.usage_tracker import SessionUsageTracker
+from content_accessibility_utility_on_aws.pdf2html.utils.pdf_validation import validate_pdf_pages
+from content_accessibility_utility_on_aws.utils.job_errors import PDFValidationError
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -589,6 +591,37 @@ def _run_pipeline(
     cleanup_bda_output: bool,
     table_only: bool = False,
 ) -> dict:
+    from ocr_preflight import prepare_pdf, add_ocr_notice
+    report_path = output_dir / 'ocr-quality.json'
+    with prepare_pdf(pdf_path, report_path) as (working_pdf, ocr_report):
+        result = _run_prepared_pipeline(
+            working_pdf, output_dir, original_filename, bda_project_arn, s3_bucket,
+            aws_profile, model_id, perform_remediation, cleanup_bda_output, table_only)
+        targets = {Path(result['conversion_result']['html_path'])}
+        if (result.get('remediation_result') or {}).get('remediated_html_path'):
+            targets.add(Path(result['remediation_result']['remediated_html_path']))
+        if result.get('layout_preview_path'):
+            targets.add(Path(result['layout_preview_path']))
+        for target in targets:
+            add_ocr_notice(target, ocr_report)
+        if result.get('layout_preview_path') and ocr_report.get('pages_selected'):
+            refresh_layout_review(result['layout_preview_path'])
+        result['ocr_report_path'] = report_path
+        return result
+
+
+def _run_prepared_pipeline(
+    pdf_path: Path,
+    output_dir: Path,
+    original_filename: str,
+    bda_project_arn: str,
+    s3_bucket: str,
+    aws_profile: str,
+    model_id: str,
+    perform_remediation: bool,
+    cleanup_bda_output: bool,
+    table_only: bool = False,
+) -> dict:
     _reset_usage_tracker()
 
     conversion_options = {
@@ -962,6 +995,19 @@ def retention_error(error):
     return jsonify({'error': str(error)}), 400
 
 
+@app.errorhandler(PDFValidationError)
+def pdf_validation_error(error):
+    if request.path.startswith('/api/'):
+        return jsonify(dict(error.safe_fields, error=str(error))), 422
+    return render_template('index.html', defaults={
+        'bda_project_arn': request.form.get('bda_project_arn', ''),
+        's3_bucket': request.form.get('s3_bucket', ''),
+        'aws_profile': request.form.get('aws_profile', ''),
+        'model_id': request.form.get('model_id', 'us.amazon.nova-lite-v1:0')},
+        max_upload_size_mb=MAX_UPLOAD_SIZE_MB,
+        table_only=request.path.startswith('/table-lab/'), error=str(error)), 422
+
+
 @app.before_request
 def analytics_submission():
     job_id = (request.view_args or {}).get('job_id')
@@ -1056,6 +1102,7 @@ def process_pdf():
             error="Only PDF uploads are supported.",
         ), 400
 
+    validate_pdf_pages(uploaded_file.stream)
     retention_fields = _request_retention()
     job_id = uuid.uuid4().hex
     job_dir = RUNS_DIR / job_id
@@ -1180,6 +1227,10 @@ def create_job():
         _bool_from_form('table_only') if uploaded_file else _bool_value(payload.get('table_only')))
     workflow = 'local_tables' if request.path == '/api/table-jobs' else 'tables' if table_only else 'full'
     source_sha256 = None
+    if uploaded_file and uploaded_file.filename:
+        if not secure_filename(uploaded_file.filename).lower().endswith('.pdf'):
+            return jsonify({'error': 'Only PDF uploads are supported.'}), 400
+        validate_pdf_pages(uploaded_file.stream)
     if get_store():
         if not uploaded_file or not uploaded_file.filename:
             return jsonify({'error': 'S3-backed jobs require a PDF upload, including cache lookups.'}), 400
@@ -1224,6 +1275,7 @@ def create_job():
         pdf_path = copied_pdf_path
         original_filename = pdf_source_path
         source_type = "path"
+        validate_pdf_pages(pdf_path)
 
     bda_project_arn = (
         (request.form.get("bda_project_arn") if uploaded_file else payload.get("bda_project_arn"))

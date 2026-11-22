@@ -151,14 +151,14 @@
 
       <section class="panel">
         {% if error %}
-          <div class="error">{{ error }}</div>
+          <div class="error" role="alert">{{ error }}</div>
         {% endif %}
 
         <form action="{% if table_only %}/table-lab/process{% else %}/process{% endif %}" method="post" enctype="multipart/form-data">
           <div class="grid">
             <label>
               PDF file
-              <input type="file" name="pdf_file" accept=".pdf,application/pdf" required>
+              <input type="file" name="pdf_file" accept=".pdf,application/pdf" required aria-describedby="pdf-page-limit">
             </label>
             {% if not table_only %}
               <label>
@@ -179,6 +179,7 @@
               </label>
             {% endif %}
           </div>
+          <p id="pdf-page-limit">PDFs must contain 100 pages or fewer. For longer documents, split the PDF into files of up to 100 pages and submit each separately.</p>
 
           <div class="checks">
             <label><input type="checkbox" name="perform_remediation" checked> Run remediation</label>
