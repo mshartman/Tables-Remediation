@@ -22,6 +22,9 @@ from content_accessibility_utility_on_aws.remediate.remediation_strategies.table
 logger = setup_logger(__name__)
 
 
+from .table_detection import detect_header_like_cells
+
+
 def apply_table_remediation(
     html_content: str,
     audit_issues: Optional[List[Dict[str, Any]]] = None,
@@ -166,10 +169,10 @@ def ensure_table_structure(html_content: str) -> str:
             first_row = table.find("tr")
 
             # Check if the first row contains th elements or is likely a header
-            if first_row.find("th") or all(
-                cell.name == "td" and cell.get("scope")
-                for cell in first_row.find_all(["td", "th"])
-            ):
+            if detect_header_like_cells(table):
+                for cell in first_row.find_all(['td', 'th'], recursive=False):
+                    cell.name = 'th'
+                    cell['scope'] = 'col'
                 # Create thead and move the first row into it
                 thead = soup.new_tag("thead")
                 first_row.extract()

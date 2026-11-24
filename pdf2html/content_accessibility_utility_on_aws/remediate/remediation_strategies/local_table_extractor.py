@@ -9,6 +9,8 @@ from __future__ import annotations
 from html import escape
 from pathlib import Path
 import pdfplumber
+from bs4 import BeautifulSoup
+from content_accessibility_utility_on_aws.table_resolution.continuation import carry_continuation_headers
 
 from content_accessibility_utility_on_aws.table_resolution.reader import resolve_page
 
@@ -26,7 +28,7 @@ def extract_pdf_tables_to_html(
 ) -> dict:
     """Extract PDF tables locally and write one accessible HTML document.
 
-    The first extracted row becomes the column-header row by default. Change
+    Column header inference uses source evidence by default. Change
     ``LOCAL_TABLE_LAB_POLICY`` while evaluating alternate extraction strategies.
     """
     pdf_path = Path(pdf_path)
@@ -87,7 +89,9 @@ def extract_pdf_tables_to_html(
   </body>
 </html>
 """
-    output_path.write_text(html, encoding="utf-8")
+    soup = BeautifulSoup(html, "html.parser")
+    carry_continuation_headers(soup)
+    output_path.write_text(str(soup), encoding="utf-8")
 
     return {
         "html_path": str(output_path),

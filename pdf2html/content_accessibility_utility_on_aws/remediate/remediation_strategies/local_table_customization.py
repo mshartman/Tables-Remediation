@@ -13,8 +13,8 @@ from dataclasses import dataclass
 class LocalTableLabPolicy:
     """Controls for interpreting tables extracted from a PDF."""
 
-    # Most source PDFs place column headings in the first extracted row.
-    first_row_is_header: bool = True
+    # None infers column headings from source evidence. True/False explicitly override.
+    first_row_is_header: bool | None = None
     # Add a heading and a navigation link for each PDF page containing tables.
     include_page_headings: bool = True
     # Prefer the visible grid drawn in many research-PDF tables. This prevents

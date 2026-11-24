@@ -235,6 +235,8 @@ def finish_output(path, doc, report, fallbacks, geometry_only, title, scan_bda=N
         "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'"})
     soup.head.insert(0, policy)
     report['article_navigation'] = decorate(soup, pages, geometry_only, title or soup.title.get_text())
+    from content_accessibility_utility_on_aws.table_resolution.continuation import carry_continuation_headers
+    carry_continuation_headers(soup)
     output = '<!doctype html>\n' + str(soup)
     path.write_text(output, encoding='utf-8')
     report['static_audit'] = audit_reader(output,table_findings=report.get('local_table_findings'))

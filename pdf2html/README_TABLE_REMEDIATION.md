@@ -25,8 +25,7 @@ The student-worker Table Lab follows a separate, offline path:
 
 The Table Lab is available at `/table-lab` and `/api/table-jobs`. It does not import
 the Bedrock table pipeline or make AWS, S3, BDA, or network calls. Start local
-experiments in `local_table_customization.py`; the first extracted row is treated
-as the column-header row by default.
+experiments in `local_table_customization.py`; untagged first rows stay in the body unless field labels and distinctive header formatting support promotion.
 
 ## Current AI decision
 
@@ -79,7 +78,7 @@ and column spans, header IDs and associations. Missing or ambiguous text require
   characters agree. A conflict retains the original elements. Rendering the optional layout
   preview still requires the authorized private renderer described in experimental_layout/README.md.
 - **Table Lab**, including the portable student package, uses the same cell renderer.
-  `first_row_is_header` controls its top header row. `first_column_is_row_header=None` recognizes
+  `first_row_is_header=None` checks source evidence. Explicit True/False overrides apply only to untagged grids. `first_column_is_row_header=None` recognizes
   common identifier headings such as Gene and Compound. Set it explicitly for other conventions.
   A table continuing across pages is represented as one segment per page.
 
@@ -93,3 +92,19 @@ lines before replacing them, keeping nearby prose and figures in place.
 Run `python -m unittest test_tagged_table_resolution test_table_resolution test_reader_tables` from `pdf2html`.
 The new tests use generated source documents and substitute a fixture for the remote BDA call.
 This integration produces HTML. The separate Adobe PDF-to-PDF workflow generates its own PDF tags.
+
+
+### Headerless and continued tables
+
+For untagged grids the default checks for recognizable column labels and typography
+that distinguishes the first row from the body. The specialized ruled-table path
+uses labels above a printed separator. If the evidence is insufficient, a verified
+grid can still be displayed as data rows. A data-only result retains a review marker.
+The tagged path preserves source cell roles (including survey row IDs).
+
+In a combined reader document, an explicit continuation caption, the same table
+number, adjacent source pages, consistent titles and compatible ordinary row widths
+allow a simple established header to be carried forward. A repeated label row is
+used once. When the continuation begins with data, a new header is added and the
+first record stays in the body. Complex, ambiguous and unsupported cases require
+review. This rule uses document-local context; an isolated page has no prior header.

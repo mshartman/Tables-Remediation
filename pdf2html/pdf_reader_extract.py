@@ -279,8 +279,9 @@ def extract_article(data, language='en', table_report=None, title=None, structur
             source_page = source.pages[number-1]
             try:
                 tagged, tag_findings = tagged_article_tables(source_page, page, blocks)
-                tables, findings = extract_tables(page, blocks, line_html, [t['bbox'] for t in tagged])
-                resolved, extra_findings = resolve_article_tables(source_page, page, blocks, tables + tagged)
+                resolved, extra_findings = resolve_article_tables(source_page, page, blocks, tagged)
+                tables, findings = extract_tables(page, blocks, line_html,
+                                                 [t['bbox'] for t in tagged + resolved])
                 resolved = tagged + resolved
                 extra_findings = tag_findings + extra_findings
             finally:

@@ -174,6 +174,8 @@ class TableRemediationPipeline:
         return caption_text
 
     def _apply_header_row(self, table: Tag, analysis: dict[str, Any]) -> Optional[str]:
+        if table.has_attr('data-local-header-status') or table.get('data-local-table') == 'tagged':
+            return None
         if table.find("th") or not self._is_confident(analysis):
             return None
         if analysis.get("action") not in {"header_row", "caption_and_header"}:

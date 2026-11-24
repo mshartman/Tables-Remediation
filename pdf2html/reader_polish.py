@@ -102,7 +102,7 @@ def repair_tables(soup, article):
             table.insert(0, caption)
         elif table.caption:
             table.insert(0, table.caption.extract())
-        if table.has_attr('data-reader-headers-repaired'):
+        if table.has_attr('data-reader-headers-repaired') or table.get('data-local-header-status') == 'unconfirmed':
             continue
         rows = [r for r in table.find_all('tr') if r.find_parent('table') is table]
         # Do not infer complex rowspans or nested tables. Preserve and flag them.

@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from image_descriptions import annotate_image_gaps
 from reader_links import add_document_links
 from reader_regions import group_regions, section_navigation, normalize_section_headings
+from content_accessibility_utility_on_aws.table_resolution.continuation import carry_continuation_headers
 from reader_polish import polish_document, source_urls, source_symbol_findings
 from reader_audit import audit_reader
 
@@ -227,6 +228,7 @@ def render_reader(path, title, pdf_path=None):
         header.insert_after(section_navigation(out, headings))
     annotate_image_gaps(out, article)
     layout.append(article)
+    carry_continuation_headers(out)
     script = out.new_tag('script'); script.string = READER_SCRIPT; out.body.append(script)
     path.write_text(str(out), encoding='utf-8')
     final_audit = audit_reader(str(out))

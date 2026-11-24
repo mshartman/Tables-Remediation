@@ -26,6 +26,9 @@ from content_accessibility_utility_on_aws.remediate.remediation_strategies.table
 logger = setup_logger(__name__)
 
 
+from .table_detection import detect_header_like_cells
+
+
 def _extract_bedrock_client(args: tuple) -> Optional[BedrockClient]:
     for arg in args:
         if arg is not None and isinstance(arg, BedrockClient):
@@ -231,6 +234,9 @@ def remediate_table_missing_headers(
     if not table:
         return None
 
+    if not detect_header_like_cells(table):
+        return None
+
     bedrock_client = _extract_bedrock_client(args)
 
     # Check if the table has any th elements
@@ -251,8 +257,9 @@ def remediate_table_missing_headers(
         first_row = table.find("tr")
         if first_row:
             # Convert all td elements in the first row to th
-            for td in first_row.find_all("td"):
+            for td in first_row.find_all("td", recursive=False):
                 td.name = "th"
+                td["scope"] = "col"
             return "Converted first row cells to header cells"
 
     return None
@@ -786,106 +793,16 @@ def remediate_table_missing_thead(
         logger.debug("Table already has thead element")
         return "Table already has thead element"
 
-    # Extract the BedrockClient if provided
-    bedrock_client = None
-    if args:
-        for arg in args:
-            if arg is not None and isinstance(arg, BedrockClient):
-                bedrock_client = arg
-                logger.debug(
-                    f"Using provided BedrockClient with model: {bedrock_client.model_id}, profile: {bedrock_client.profile}"
-                )
-                break
-
-    # If AI is not available, use fallback method
-    if not bedrock_client:
-        logger.warning(
-            "BedrockClient not available for table thead remediation - using fallback method"
-        )
-
-        # First row is typically the header row
-        rows = table.find_all("tr")
-        if rows:
-            first_row = rows[0]
-            # Check if first row has header cells
-            if first_row.find("th"):
-                # Create thead element and move first row into it
-                thead = soup.new_tag("thead")
-                first_row.extract()
-                thead.append(first_row)
-                table.insert(0, thead)
-                return "Added thead element with first row (fallback method)"
-            else:
-                # Convert first row cells to headers and then add to thead
-                for td in first_row.find_all("td"):
-                    td.name = "th"
-                thead = soup.new_tag("thead")
-                first_row.extract()
-                thead.append(first_row)
-                table.insert(0, thead)
-                return "Converted first row to headers and added thead element (fallback method)"
-
+    if not detect_header_like_cells(table):
         return None
-
-    if not table.find("thead"):
-        # Find header rows using AI
-        header_rows = []
-        all_rows = table.find_all("tr")
-
-        # Create a simplified representation of the table
-        table_html = str(table)
-        prompt = f"""
-        Analyze this HTML table structure and determine which rows should be part of the table header (thead).
-        Consider semantic meaning, formatting, and the content of cells to identify header rows.
-        
-        HTML Table:
-        {table_html}
-        
-        Respond with ONLY the zero-based indices of rows that should be in the thead, in JSON array format.
-        For example: [0] for just the first row, or [0, 1] for the first and second rows.
-        """
-
-        try:
-            json_response = bedrock_client.generate_text(prompt, purpose="table_remediation", max_tokens=2000)
-            # Extract just the JSON part
-            json_start = json_response.find("[")
-            json_end = json_response.rfind("]") + 1
-            if json_start >= 0 and json_end > json_start:
-                json_text = json_response[json_start:json_end]
-                header_indices = json.loads(json_text)
-
-                # Get the corresponding rows
-                all_rows = table.find_all("tr")
-                header_rows = [all_rows[i] for i in header_indices if i < len(all_rows)]
-                logger.debug(f"AI identified header rows: {header_indices}")
-            else:
-                # Fallback: use first row as header
-                header_rows = [all_rows[0]] if all_rows else []
-                logger.error(
-                    "AI returned no valid JSON for thead analysis - using first row as fallback"
-                )
-        except Exception as e:
-            # Fallback: use first row as header
-            logger.error(
-                f"Failed to use AI for thead analysis: {e} - using first row as fallback"
-            )
-            header_rows = [all_rows[0]] if all_rows else []
-
-        if header_rows:
-            # Create thead element
-            thead = soup.new_tag("thead")
-
-            # Move header rows to thead
-            for row in header_rows:
-                row.extract()
-                thead.append(row)
-
-            # Insert thead at the beginning of the table
-            table.insert(0, thead)
-
-            return f"Added thead element to table with {len(header_rows)} header row(s)"
-
-    return None
+    first = table.find("tr")
+    for cell in first.find_all(["td", "th"], recursive=False):
+        cell.name = "th"
+        cell["scope"] = "col"
+    thead = soup.new_tag("thead")
+    thead.append(first.extract())
+    table.insert(0, thead)
+    return "Grouped verified column headings in thead"
 
 
 def remediate_table_missing_tbody(

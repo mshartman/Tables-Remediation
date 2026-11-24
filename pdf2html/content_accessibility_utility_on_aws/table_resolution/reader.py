@@ -1,5 +1,7 @@
 """Build semantic tables from local PDF coordinates before document remediation."""
 from dataclasses import dataclass, field
+import re
+from bs4 import BeautifulSoup
 
 from .html_tables import table_html
 from .table_structure import detect_page
@@ -12,7 +14,7 @@ class PageTables:
     review: list[str] = field(default_factory=list)
 
 
-def resolve_page(page, *, first_row_is_header=True, row_headers=None, line_settings=None):
+def resolve_page(page, *, first_row_is_header=None, row_headers=None, line_settings=None):
     result = PageTables()
     tagged = tagged_tables(page)
     for record in tagged:
@@ -27,8 +29,18 @@ def resolve_page(page, *, first_row_is_header=True, row_headers=None, line_setti
         # Namespace generated HTML IDs independently of the detector's JSON IDs.
         table['id'] = 'local-table-' + table['id']
         try:
-            result.tables.append(table_html(table, page.chars, page.page_number,
-                                            int(first_row_is_header), row_headers))
+            html = table_html(table, page.chars, page.page_number, first_row_is_header, row_headers)
+            left, top, right, _ = a
+            if top > page.bbox[1]+1:
+                band = page.within_bbox((page.bbox[0], max(page.bbox[1],top-40), page.bbox[2],top))
+                captions = [line['text'] for line in band.extract_text_lines(return_chars=False)
+                            if abs(line['x0']-left) <= 12 and line['x1'] <= right+2
+                            and top-line['bottom'] <= 15 and re.match(r'^Table\s+\d+\b',line['text'],re.I)]
+                if len(captions) == 1:
+                    fragment = BeautifulSoup(html, 'html.parser')
+                    fragment.caption.string = captions[0]
+                    html = str(fragment)
+            result.tables.append(html)
         except ValueError as error:
             result.review.append(f'Page {page.page_number}: {error}')
     return result

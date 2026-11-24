@@ -4,6 +4,8 @@ from bisect import bisect_right
 
 from pdfplumber.utils import extract_text
 
+from .header_policy import inferred_header_rows
+
 
 def assign_characters(table, characters):
     """Assign each intersecting glyph once, rejecting uncertain ownership."""
@@ -38,17 +40,19 @@ def assign_characters(table, characters):
     return groups
 
 
-def table_html(table, characters, page_number, header_rows=0, row_headers=False):
+def table_html(table, characters, page_number, header_rows=None, row_headers=False):
     groups = assign_characters(table, characters)
     prefix = table['id']
+    values = {key: extract_text(chars, x_tolerance_ratio=0.15, y_tolerance=3) or ''
+              for key, chars in groups.items()}
+    cells = sorted(table['cells'], key=lambda c: (c['row'], c['column']))
+    if header_rows is None:
+        header_rows = inferred_header_rows(cells, values, groups)
     if not 0 <= header_rows < table['row_count']:
         raise ValueError('The selected header count must leave at least one body row.')
     for cell in table['cells']:
         if cell['row'] < header_rows < cell['row'] + cell['row_span']:
             raise ValueError('A merged cell crosses the selected header/body boundary.')
-    values = {key: extract_text(chars, x_tolerance_ratio=0.15, y_tolerance=3) or ''
-              for key, chars in groups.items()}
-    cells = sorted(table['cells'], key=lambda c: (c['row'], c['column']))
     columns = [c for c in cells if c['row'] < header_rows]
     if row_headers is None:
         first = next((c for c in columns if c['column'] == 0 and c['column_span'] == 1), None)
@@ -56,12 +60,13 @@ def table_html(table, characters, page_number, header_rows=0, row_headers=False)
                            {'gene', 'compound', 'name', 'identifier', 'id'})
     row_labels = [c for c in cells if row_headers and c['row'] >= header_rows
                   and c['column'] == 0 and c['column_span'] == 1]
-    sections = [c for c in cells if c['row'] >= header_rows and c['column'] == 0
+    sections = [c for c in cells if c['row'] >= max(1, header_rows) and c['column'] == 0
                 and c['column_span'] == table['column_count'] and c['row_span'] == 1]
     header_ids = {c['id'] for c in columns + row_labels + sections if values[c['id']].strip()}
     label = f'Table on PDF page {page_number}'
+    status = 'data-reader-headers-repaired=""' if header_rows else 'data-local-header-status="unconfirmed"'
     result = [f'<div class="table-scroll" style="overflow-x:auto" role="region" tabindex="0" aria-labelledby="{prefix}-title">',
-              f'<table data-reader-headers-repaired=""><caption id="{prefix}-title">{label} · {table["column_count"]} columns</caption>']
+              f'<table {status}><caption id="{prefix}-title">{label} · {table["column_count"]} columns</caption>']
     if header_rows:
         result.append('<thead>')
     else:

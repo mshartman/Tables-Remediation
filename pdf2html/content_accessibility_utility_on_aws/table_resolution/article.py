@@ -74,7 +74,8 @@ def attach_source_lines(tag, bbox, local, lines, recovered, caption_bbox=None):
             tag.caption.string = line_text(caption).strip()
             box[1] = caption['bbox'][1]
             local.append(caption)
-    tag['data-reader-headers-repaired'] = ''
+    if tag.get("data-local-header-status") != "unconfirmed":
+        tag["data-reader-headers-repaired"] = ""
     recovered.append(dict(bbox=box, html=str(tag), consumed={id(line) for line in local}))
     return True
 
@@ -90,21 +91,19 @@ def resolve_article_tables(source, page, blocks, existing):
         if any(overlaps(bbox, old['bbox']) for old in existing + recovered):
             continue
         if any(overlaps(bbox, image['bbox']) for image in page.get_image_info()):
+            findings.append(dict(status='needs_review', bbox=bbox, reason='Image overlaps the candidate; check the source scan or artwork.'))
             continue
         if any(overlaps(bbox, link['from']) for link in page.get_links()):
             continue
         local = [line for line in lines if overlaps(bbox, line['bbox'])]
-        top_band = table['y_boundaries'][1]
-        headers = [span for line in local if line['bbox'][3] <= top_band + 1
-                   for span in line['spans'] if span['text'].strip()]
-        if not headers or not all('bold' in span['font'].lower() for span in headers):
-            continue
         try:
-            markup = table_html(table, source.chars, page.number + 1, 1, None)
+            markup = table_html(table, source.chars, page.number + 1, None, None)
         except ValueError as error:
             findings.append(dict(status='needs_review', bbox=bbox, reason=str(error)))
             continue
         tag = BeautifulSoup(markup, 'html.parser').table
+        if not tag.thead and table['method'] != 'lines':
+            continue  # Uncertain alignment without printed cell boundaries.
         tag['data-local-table'] = 'resolved'
         if not attach_source_lines(tag, bbox, local, lines, recovered):
             findings.append(dict(status='needs_review', bbox=bbox,

@@ -8,6 +8,8 @@ This module provides functions to detect and preprocess tables for remediation,
 particularly handling cases where tables from PDF conversions lack proper semantic markup.
 """
 
+import re
+from content_accessibility_utility_on_aws.table_resolution.header_policy import established_column_headers
 from bs4 import BeautifulSoup, Tag
 
 from content_accessibility_utility_on_aws.utils.logging_helper import setup_logger
@@ -26,38 +28,29 @@ def detect_header_like_cells(table: Tag) -> bool:
     Returns:
         True if header-like cells are detected, False otherwise
     """
-    # No need to check if the table already has proper headers
-    if table.find("th"):
+    if table.has_attr('data-local-header-status') or table.get('data-local-table') == 'tagged':
+        return False
+    rows = [r for r in table.select('tr') if r.find_parent('table') is table]
+    if len(rows) < 2:
+        return False
+    cells = rows[0].find_all(['td','th'], recursive=False)
+    if not cells:
+        return False
+    if all(c.name == 'th' and c.get('scope') in ('col','colgroup') for c in cells):
+        return True
+    if any(c.name != 'td' for c in cells):
         return False
 
-    # Check if the table has rows
-    rows = table.find_all("tr")
-    if not rows:
-        return False
+    def bold(cell):
+        text = cell.get_text(strip=True)
+        marked = cell.find(['strong', 'b'])
+        return bool((marked and text and marked.get_text(strip=True) == text)
+                    or re.search(r'font-weight:\s*(?:bold|[789]00)\b', cell.get('style', ''), re.I))
+    body = [c for r in rows[1:] for c in r.find_all(['th','td'], recursive=False)]
+    return established_column_headers([c.get_text(' ', strip=True) for c in cells],
+                                      sum(map(bold, cells))/len(cells),
+                                      sum(map(bold, body))/max(1,len(body)))
 
-    first_row = rows[0]
-    first_row_cells = first_row.find_all("td")
-
-    # Common indicators of header cells
-    header_indicators = 0
-
-    # Check for bold text in cells
-    for cell in first_row_cells:
-        if cell.find("b") or cell.find("strong"):
-            header_indicators += 1
-
-        # Check for style attributes that might indicate headers
-        cell_style = cell.get("style", "")
-        if "bold" in cell_style.lower() or "font-weight" in cell_style.lower():
-            header_indicators += 1
-
-        # Check for class attributes that might indicate headers
-        cell_classes = cell.get("class", [])
-        if any("header" in cls.lower() for cls in cell_classes):
-            header_indicators += 1
-
-    # If more than 50% of cells have header indicators, this is likely a header row
-    return header_indicators > len(first_row_cells) / 2
 
 
 def preprocess_tables(html: str) -> str:
@@ -98,7 +91,7 @@ def preprocess_tables(html: str) -> str:
                 row["style"] = f"{row_style}; border: 1px solid black;"
 
         # Skip tables that already have proper structure
-        if table.find("thead") and table.find("tbody"):
+        if table.find("thead") or table.find("th"):
             continue
 
         # Get all rows

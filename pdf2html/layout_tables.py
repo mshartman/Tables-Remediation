@@ -5,6 +5,7 @@ Uncertain column/row assignments are reported, never substituted for source text
 from html import escape
 import re
 import unicodedata
+from content_accessibility_utility_on_aws.table_resolution.header_policy import plausible_labels
 
 
 def plain(words):
@@ -81,6 +82,8 @@ def ruled_tables(page):
                 rows[row[-1]][cols[0]].append(word)
             if any(not cell for row in rows for cell in row):raise ValueError('Some detected cells are empty or ambiguous.')
             labels=[plain(g['words']) for g in groups]
+            if not plausible_labels(labels):
+                raise ValueError('Labels above the separator do not establish column headers.')
             values=[[plain(cell) for cell in row] for row in rows]
             if len({id(w) for row in rows for cell in row for w in cell})!=len(body):
                 raise ValueError('Source words were not assigned exactly once.')

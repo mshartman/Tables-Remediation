@@ -5,6 +5,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup, NavigableString, Tag
 import pdfplumber
 
+from .continuation import carry_continuation_headers
 from .reader import resolve_page
 
 
@@ -120,4 +121,5 @@ def resolve_document(pdf_path, html_dir, *, single_file, page_range=None):
                 if not single_file:
                     path.write_text(str(soup), encoding='utf-8')
         if single_file and changed:
+            carry_continuation_headers(soup)
             path.write_text(str(soup), encoding='utf-8')
