@@ -13,21 +13,15 @@ from dataclasses import dataclass
 class LocalTableLabPolicy:
     """Controls for interpreting tables extracted from a PDF."""
 
-    # Most source PDFs place column headings in the first extracted row.
-    first_row_is_header: bool = True
+    # None infers column headings from source evidence. True/False explicitly override.
+    first_row_is_header: bool | None = None
     # Add a heading and a navigation link for each PDF page containing tables.
     include_page_headings: bool = True
     # Prefer the visible grid drawn in many research-PDF tables. This prevents
     # pdfplumber from guessing columns from the text's horizontal positions.
     table_settings: dict | None = None
+    # None recognizes common identifier headings, including Gene and Compound.
+    first_column_is_row_header: bool | None = None
 
 
-LOCAL_TABLE_LAB_POLICY = LocalTableLabPolicy(
-    table_settings={
-        "vertical_strategy": "lines",
-        "horizontal_strategy": "lines",
-        "snap_tolerance": 4,
-        "join_tolerance": 4,
-        "intersection_tolerance": 4,
-    }
-)
+LOCAL_TABLE_LAB_POLICY = LocalTableLabPolicy()

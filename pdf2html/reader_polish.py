@@ -90,16 +90,19 @@ def repair_tables(soup, article):
         if table.parent and 'reader-table' in table.parent.get('class', []):
             previous = table.parent.find_previous_sibling()
         if previous and previous.name == 'p' and re.match(r'^Table\s+\d+[.:\s]', previous.get_text(' ', strip=True), re.I):
+            old_caption_id = table.caption.get("id") if table.caption else None
             if table.caption:
                 table.caption.decompose()
             caption = soup.new_tag('caption')
+            if old_caption_id:
+                caption['id'] = old_caption_id
             for child in list(previous.contents):
                 caption.append(child.extract())
             previous.decompose()
             table.insert(0, caption)
         elif table.caption:
             table.insert(0, table.caption.extract())
-        if table.has_attr('data-reader-headers-repaired'):
+        if table.has_attr('data-reader-headers-repaired') or table.get('data-local-header-status') == 'unconfirmed':
             continue
         rows = [r for r in table.find_all('tr') if r.find_parent('table') is table]
         # Do not infer complex rowspans or nested tables. Preserve and flag them.

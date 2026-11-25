@@ -21,12 +21,11 @@ The student-worker Table Lab follows a separate, offline path:
 | File | Purpose |
 | --- | --- |
 | `local_table_customization.py` | Student-editable local extraction policy. |
-| `local_table_extractor.py` | Extracts PDF tables with `pdfplumber` and produces accessible starter HTML. |
+| `local_table_extractor.py` | Uses the shared local table resolver and writes its semantic tables to HTML. |
 
-This path is used only by `/table-lab` and `/api/table-jobs`. It does not import
+The Table Lab is available at `/table-lab` and `/api/table-jobs`. It does not import
 the Bedrock table pipeline or make AWS, S3, BDA, or network calls. Start local
-experiments in `local_table_customization.py`; the first extracted row is treated
-as the column-header row by default.
+experiments in `local_table_customization.py`; untagged first rows stay in the body unless field labels and distinctive header formatting support promotion.
 
 ## Current AI decision
 
@@ -56,3 +55,56 @@ Start in `table_customization.py`.
 Avoid changing `table_remediation.py` until you know whether the output problem is
 an AI classification problem or a structural HTML problem. That file directly
 changes document markup and has broader effects.
+
+## Table resolution across the HTML readers
+
+The shared implementation is in `content_accessibility_utility_on_aws/table_resolution/`.
+Its page geometry routines come from [pdf-table-structure at d95e548](https://github.com/rishrm/pdf-table-structure/tree/d95e548).
+It runs locally, assigns characters to detected cell boxes, and emits native HTML tables with row
+and column spans, header IDs and associations. Missing or ambiguous text requires review.
+
+- **Local article upload and geometry layout** use resolved cells alongside existing table detection.
+  Source lines are removed only when their visible character inventory matches the resolved cells.
+  Bold header evidence, common page coordinates and a region free of images and links are required
+  for the new inline replacement. Captions, surrounding prose and page order stay in the article.
+- **Combined and individual BDA HTML outputs** pass through the same resolver before the
+  normal audit/remediation steps used by the service, CLI and PDF-to-HTML Lambda. A unique run
+  of plain paragraphs accounting for all cell words can be replaced. Otherwise a labeled
+  disclosure provides the reconstructed reading option alongside the original content. Existing
+  semantic tables with matching cell contents are kept. Nonstandard combined-page mappings and
+  page-range selections skip this step. Set conversion option `resolve_local_tables=False` to
+  skip this postprocessing.
+- **Saved BDA layout mode** substitutes a TABLE element where the page, bounds and source
+  characters agree. A conflict retains the original elements. Rendering the optional layout
+  preview still requires the authorized private renderer described in experimental_layout/README.md.
+- **Table Lab**, including the portable student package, uses the same cell renderer.
+  `first_row_is_header=None` checks source evidence. Explicit True/False overrides apply only to untagged grids. `first_column_is_row_header=None` recognizes
+  common identifier headings such as Gene and Compound. Set it explicitly for other conventions.
+  A table continuing across pages is represented as one segment per page.
+
+For single-page rectangular tables, the reader first checks the PDF structure tree.
+It resolves the marked content of each tagged cell and preserves its row order.
+A survey with consecutive Q identifiers retains all its data rows and uses the
+identifiers as HTML row headers. Missing, ambiguous or unsupported tags fall
+back to the existing detection paths. The article reader also checks the source
+lines before replacing them, keeping nearby prose and figures in place.
+
+Run `python -m unittest test_tagged_table_resolution test_table_resolution test_reader_tables` from `pdf2html`.
+The new tests use generated source documents and substitute a fixture for the remote BDA call.
+This integration produces HTML. The separate Adobe PDF-to-PDF workflow generates its own PDF tags.
+
+
+### Headerless and continued tables
+
+For untagged grids the default checks for recognizable column labels and typography
+that distinguishes the first row from the body. The specialized ruled-table path
+uses labels above a printed separator. If the evidence is insufficient, a verified
+grid can still be displayed as data rows. A data-only result retains a review marker.
+The tagged path preserves source cell roles (including survey row IDs).
+
+In a combined reader document, an explicit continuation caption, the same table
+number, adjacent source pages, consistent titles and compatible ordinary row widths
+allow a simple established header to be carried forward. A repeated label row is
+used once. When the continuation begins with data, a new header is added and the
+first record stays in the body. Complex, ambiguous and unsupported cases require
+review. This rule uses document-local context; an isolated page has no prior header.

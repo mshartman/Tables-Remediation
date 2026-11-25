@@ -1,0 +1,757 @@
+"""Detect and validate PDF table geometry using local page evidence."""
+from __future__ import annotations
+
+import copy
+import math
+import statistics
+
+
+def cluster_boundaries(values, tolerance=1.0):
+    """Cluster by total range, so long chains cannot collapse a narrow cell."""
+    groups = []
+    for value in sorted(set(float(v) for v in values)):
+        if groups and value - groups[-1][0] <= tolerance:
+            groups[-1].append(value)
+        else:
+            groups.append([value])
+    return [round(sum(group) / len(group), 3) for group in groups]
+
+
+def check_grid(table):
+    """Check logical occupancy; validity is not a claim of detection accuracy."""
+    occupied = set()
+    warnings = []
+    for cell in table["cells"]:
+        for row in range(cell["row"], cell["row"] + cell["row_span"]):
+            for column in range(cell["column"], cell["column"] + cell["column_span"]):
+                if (row, column) in occupied:
+                    warnings.append("overlapping_grid_cells")
+                occupied.add((row, column))
+    total = table["row_count"] * table["column_count"]
+    if len(occupied) < total:
+        warnings.append("uncovered_grid_slots")
+    return sorted(set(warnings))
+
+
+def structure_from_cells(raw_cells, method, tolerance=1.0):
+    boxes = sorted(set(tuple(float(v) for v in box) for box in raw_cells),
+                   key=lambda b: (b[1], b[0], b[3], b[2]))
+    if not boxes or any(not all(math.isfinite(v) for v in b) or
+                        b[0] >= b[2] or b[1] >= b[3] for b in boxes):
+        raise ValueError("Invalid cell geometry")
+    xs = cluster_boundaries([b[i] for b in boxes for i in (0, 2)], tolerance)
+    ys = cluster_boundaries([b[i] for b in boxes for i in (1, 3)], tolerance)
+    if (len(xs) - 1) * (len(ys) - 1) > 65536:
+        raise ValueError("Grid area exceeds the local processing budget")
+    cells = []
+    for index, box in enumerate(boxes):
+        left, right = [min(range(len(xs)), key=lambda i: abs(xs[i] - box[j]))
+                       for j in (0, 2)]
+        top, bottom = [min(range(len(ys)), key=lambda i: abs(ys[i] - box[j]))
+                       for j in (1, 3)]
+        if left >= right or top >= bottom:
+            raise ValueError("Cell too small for boundary tolerance")
+        cells.append({"id": f"c{index:04d}", "row": top, "column": left,
+                      "row_span": bottom - top, "column_span": right - left,
+                      "bbox": [xs[left], ys[top], xs[right], ys[bottom]]})
+    table = {"bbox": [xs[0], ys[0], xs[-1], ys[-1]],
+             "method": method, "row_count": len(ys) - 1,
+             "column_count": len(xs) - 1, "x_boundaries": xs,
+             "y_boundaries": ys, "cells": cells}
+    table["warnings"] = check_grid(table)
+    if method == "text":
+        table["warnings"].append("experimental_borderless_detection")
+    return table
+
+
+def word_boxes_only(page):
+    # pdfplumber uses text locally for word segmentation. Only positions survive.
+    # Scale the join tolerance to font size: a fixed three-point gap can merge
+    # a publisher's entire line into one word when spaces are positioning gaps.
+    return [[round(word[k], 3) for k in ("x0", "top", "x1", "bottom")]
+            for word in page.extract_words(x_tolerance_ratio=0.15)]
+
+
+def vector_geometry_region(region):
+    """Ignore redundant fill-only repaint edges, retaining the original PDF.
+
+    A contained rectangle of the same color adds no boundary by itself. Keep
+    thin rules, strokes, and any rectangle whose interior meets another color
+    or drawing. The filtered view is used only by the vector table finder.
+    """
+    rects = getattr(region, "rects", [])
+    if not rects or not hasattr(region, "filter"):
+        return region, {"status": "unchanged", "ignored_repaint_rectangles": 0}
+    drawings = list(getattr(region, "lines", [])) + list(getattr(region, "curves", [])) + \
+        list(getattr(region, "images", []))
+    if len(rects) > 1000 or len(drawings) > 6000:
+        return region, {"status": "budget_exceeded", "ignored_repaint_rectangles": 0}
+
+    def box(obj):
+        b = tuple(float(obj[k]) for k in ("x0", "top", "x1", "bottom"))
+        if not all(math.isfinite(v) for v in b):
+            raise ValueError("nonfinite_geometry")
+        return b
+
+    def color(obj):
+        value = obj.get("non_stroking_color")
+        if isinstance(value, (int, float)):
+            value = (value,)
+        if not isinstance(value, (list, tuple)) or len(value) not in (1, 3, 4) or \
+                any(not isinstance(v, (int, float)) or not math.isfinite(v) for v in value):
+            return None
+        return tuple(value)
+
+    def meets_interior(a, b):
+        return min(a[2] - .01, b[2]) >= max(a[0] + .01, b[0]) and \
+               min(a[3] - .01, b[3]) >= max(a[1] + .01, b[1])
+
+    info = [(obj, box(obj), color(obj)) for obj in rects]
+    blockers = [box(obj) for obj in drawings]
+    fills = [item for item in info if item[0].get("fill") and not item[0].get("stroke")
+             and item[2] is not None and min(item[1][2] - item[1][0], item[1][3] - item[1][1]) > 1]
+    ignored = set()
+    for obj, b, ink in fills:
+        area = (b[2] - b[0]) * (b[3] - b[1])
+        contained = any(other is not obj and other_ink == ink and
+            outer[0] <= b[0] and outer[1] <= b[1] and outer[2] >= b[2] and outer[3] >= b[3] and
+            (outer[2] - outer[0]) * (outer[3] - outer[1]) > area + 1
+            for other, outer, other_ink in fills)
+        if not contained or any(meets_interior(b, other) for other in blockers):
+            continue
+        if any(other is not obj and (other.get("stroke") or
+                (other.get("fill") and other_ink != ink)) and meets_interior(b, other_box)
+               for other, other_box, other_ink in info):
+            continue
+        ignored.add(id(obj))
+    details = {"status": "applied" if ignored else "unchanged",
+               "ignored_repaint_rectangles": len(ignored)}
+    return (region.filter(lambda obj: id(obj) not in ignored) if ignored else region), details
+
+
+def boxes_in_table(boxes, bbox):
+    return [box for box in boxes if
+            bbox[0] <= (box[0] + box[2]) / 2 <= bbox[2] and
+            bbox[1] <= (box[1] + box[3]) / 2 <= bbox[3]]
+
+
+def collapse_text_gaps(table, boxes):
+    """Drop whitespace-only interstitial bands in text-strategy tables.
+
+    Deliberately restricted to tables without vertical spans. This does not
+    solve wrapped-text vs. logical-row ambiguity, which remains a warning.
+    """
+    if any(c["row_span"] != 1 for c in table["cells"]):
+        return
+    ys = table["y_boundaries"]
+    active = [r for r in range(table["row_count"]) if any(
+        ys[r] <= (b[1] + b[3]) / 2 < ys[r + 1] for b in boxes)]
+    if not active or len(active) == table["row_count"]:
+        return
+    boundaries = [ys[active[0]]]
+    boundaries += [(ys[a + 1] + ys[b]) / 2 for a, b in zip(active, active[1:])]
+    boundaries += [ys[active[-1] + 1]]
+    boundaries = [round(v, 3) for v in boundaries]
+    row_map = {old: new for new, old in enumerate(active)}
+    cells = []
+    for original in table["cells"]:
+        if original["row"] not in row_map:
+            continue
+        cell = copy.deepcopy(original)
+        cell["row"] = row_map[cell["row"]]
+        cell["bbox"][1] = boundaries[cell["row"]]
+        cell["bbox"][3] = boundaries[cell["row"] + 1]
+        cells.append(cell)
+    for index, cell in enumerate(cells):
+        cell["id"] = f"c{index:04d}"
+    table.update(row_count=len(active), y_boundaries=boundaries, cells=cells)
+    table["bbox"][1], table["bbox"][3] = boundaries[0], boundaries[-1]
+    table["warnings"] = check_grid(table) + [
+        "experimental_borderless_detection", "whitespace_row_bands_collapsed",
+        "wrapped_text_may_be_split_into_rows"]
+
+
+def space_text_boundaries(table, boxes, bounds):
+    """Place inferred dividers within observed whitespace, rather than on text."""
+    original_bbox = list(table["bbox"])
+    table_words = boxes_in_table(boxes, original_bbox)
+    xs = table["x_boundaries"]
+    columns = [[] for _ in range(table["column_count"])]
+    for box in table_words:
+        center = (box[0] + box[2]) / 2
+        for index in range(len(columns)):
+            if xs[index] <= center <= xs[index + 1]:
+                columns[index].append(box)
+                break
+    updated = list(xs)
+    for index in range(1, len(xs) - 1):
+        if columns[index - 1] and columns[index]:
+            left = max(b[2] for b in columns[index - 1])
+            right = min(b[0] for b in columns[index])
+            if left < right:
+                updated[index] = round((left + right) / 2, 3)
+    updated[0] = max(bounds[0], updated[0] - 4)
+    updated[-1] = min(bounds[2], updated[-1] + 4)
+    ys = list(table["y_boundaries"])
+    ys[0] = max(bounds[1], ys[0] - 4)
+    ys[-1] = min(bounds[3], ys[-1] + 4)
+    # Padding must not turn a neighboring caption/footnote into a table word.
+    # Keep the original edge wherever expansion would admit a new word center;
+    # independent edges and the internal gutter correction remain usable.
+    expanded = [updated[0], ys[0], updated[-1], ys[-1]]
+    for box in boxes_in_table(boxes, expanded):
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        if cx < original_bbox[0]:
+            updated[0] = original_bbox[0]
+        if cx > original_bbox[2]:
+            updated[-1] = original_bbox[2]
+        if cy < original_bbox[1]:
+            ys[0] = original_bbox[1]
+        if cy > original_bbox[3]:
+            ys[-1] = original_bbox[3]
+    table["x_boundaries"], table["y_boundaries"] = updated, ys
+    table["bbox"] = [updated[0], ys[0], updated[-1], ys[-1]]
+    for cell in table["cells"]:
+        r, c = cell["row"], cell["column"]
+        cell["bbox"] = [updated[c], ys[r], updated[c + cell["column_span"]],
+                        ys[r + cell["row_span"]]]
+    table["warnings"].append("boundaries_inferred_from_word_gaps")
+
+
+def apply_merges(table, groups):
+    """Apply already-validated merges to a separate review candidate."""
+    result = copy.deepcopy(table)
+    by_id = {c["id"]: c for c in table["cells"]}
+    consumed = {cid for group in groups for cid in group}
+    result["cells"] = [c for c in result["cells"] if c["id"] not in consumed]
+    for index, group in enumerate(groups):
+        cells = [by_id[cid] for cid in group]
+        row, column = min(c["row"] for c in cells), min(c["column"] for c in cells)
+        bottom = max(c["row"] + c["row_span"] for c in cells)
+        right = max(c["column"] + c["column_span"] for c in cells)
+        result["cells"].append({"id": f"m{index:04d}", "row": row,
+            "column": column, "row_span": bottom - row,
+            "column_span": right - column,
+            "bbox": [table["x_boundaries"][column], table["y_boundaries"][row],
+                     table["x_boundaries"][right], table["y_boundaries"][bottom]],
+            "source_cell_ids": group})
+    result["cells"].sort(key=lambda c: (c["row"], c["column"]))
+    result["warnings"] = sorted(set(result["warnings"] + check_grid(result) +
+                                     ["model_proposal_requires_visual_review"]))
+    return result
+
+
+def text_evidence(table, boxes, region_bbox):
+    """Conservative geometry checks, without inspecting word meanings."""
+    words = boxes_in_table(boxes, table["bbox"])
+    counts = {cell["id"]: 0 for cell in table["cells"]}
+    cell_words = {cell["id"]: [] for cell in table["cells"]}
+    divider_rows = [set() for _ in range(table["column_count"] - 1)]
+    divider_cuts = [set() for _ in divider_rows]
+    cuts = 0
+    for word in words:
+        cx, cy = (word[0] + word[2]) / 2, (word[1] + word[3]) / 2
+        cell = next((c for c in table["cells"] if
+                     c["bbox"][0] <= cx <= c["bbox"][2] and
+                     c["bbox"][1] <= cy <= c["bbox"][3]), None)
+        if cell is None:
+            cuts += 1
+            continue
+        counts[cell["id"]] += 1
+        cell_words[cell["id"]].append(word)
+        b = cell["bbox"]
+        # Score each real cell edge separately. A wide grid must not dilute
+        # a divider that repeatedly cuts words; merged-cell interiors are not
+        # dividers and do not contribute crossings.
+        for edge, crossed in (
+                (cell["column"], word[0] < b[0] - .75),
+                (cell["column"] + cell["column_span"], word[2] > b[2] + .75)):
+            if 0 < edge < table["column_count"]:
+                divider_rows[edge - 1].add(cell["row"])
+                if crossed:
+                    divider_cuts[edge - 1].add(cell["row"])
+        if word[0] < b[0] - 0.75 or word[2] > b[2] + 0.75 or \
+                word[1] < b[1] - 0.75 or word[3] > b[3] + 0.75:
+            cuts += 1
+    nonempty = [count for count in counts.values() if count]
+    evidence = {"word_boxes": len(words), "word_cut_fraction":
+                round(cuts / len(words), 4) if words else 0,
+                "median_words_per_nonempty_cell": statistics.median(nonempty) if nonempty else 0}
+    column_medians = []
+    for column in range(table["column_count"]):
+        values = [counts[c["id"]] for c in table["cells"] if
+                  c["column"] == column and c["column_span"] == 1 and counts[c["id"]]]
+        column_medians.append(statistics.median(values) if values else 0)
+    table_width = table["bbox"][2] - table["bbox"][0]
+    heavy_columns = [i for i, value in enumerate(column_medians) if value >= 8 and
+        table["x_boundaries"][i + 1] - table["x_boundaries"][i] >= 0.3 * table_width]
+    evidence["column_word_medians"] = column_medians
+    word_height = statistics.median(w[3] - w[1] for w in words) if words else 0
+    def aligned_fraction(values):
+        ordered = sorted(values)
+        best = first = 0
+        for last, value in enumerate(ordered):
+            while value - ordered[first] > max(.75, .1 * word_height):
+                first += 1
+            best = max(best, last - first + 1)
+        return best / len(ordered) if ordered else 0
+
+    column_extents, column_alignment, column_start_alignment = [], [], []
+    for column in range(table["column_count"]):
+        entries = [cell_words[c["id"]] for c in table["cells"] if
+                   c["column"] == column and c["column_span"] == 1 and cell_words[c["id"]]]
+        column_extents.append([w for entry in entries for w in entry])
+        extents = [(min(w[0] for w in entry), max(w[2] for w in entry)) for entry in entries]
+        left_alignment = aligned_fraction(a for a, _ in extents)
+        column_start_alignment.append(left_alignment)
+        column_alignment.append(max(left_alignment,
+            aligned_fraction(b for _, b in extents),
+            aligned_fraction((a + b) / 2 for a, b in extents)))
+    evidence["column_start_alignment"] = [round(v, 4) for v in column_start_alignment]
+    evidence["column_field_alignment"] = [round(v, 4) for v in column_alignment]
+    narrow_prose_gutters = []
+    for column, (left, right) in enumerate(zip(column_extents, column_extents[1:]), 1):
+        if not left or not right:
+            continue
+        gutter = min(w[0] for w in right) - max(w[2] for w in left)
+        # A normal interword space, wordy cells on both sides and a field with
+        # no stable left/right/center alignment together indicate flowing prose.
+        # Compact numeric fields or consistently aligned text fields are kept.
+        if table["row_count"] >= 4 and 0 <= gutter < .5 * word_height and \
+                min(column_medians[column - 1:column + 1]) >= 3 and \
+                min(column_alignment[column - 1:column + 1]) < .75:
+            narrow_prose_gutters.append({"column_boundary": column,
+                                        "gap_points": round(gutter, 3)})
+    evidence["narrow_prose_gutters"] = narrow_prose_gutters
+    evidence["divider_word_crossings"] = [{"column_boundary": i + 1,
+        "observed_rows": len(rows), "cut_rows": len(divider_cuts[i])}
+        for i, rows in enumerate(divider_rows)]
+    evidence["long_prose_column_beside_short_cells"] = bool(
+        table["row_count"] >= 4 and table["column_count"] <= 5 and heavy_columns and
+        any(0 < value <= 3 for i, value in enumerate(column_medians) if i not in heavy_columns))
+    reasons = []
+    if words and evidence["word_cut_fraction"] > 0.18:
+        reasons.append("inferred_boundaries_cut_words")
+    if any(len(cut) >= 3 and len(cut) >= .5 * len(rows)
+           for cut, rows in zip(divider_cuts, divider_rows)):
+        reasons.append("column_divider_repeatedly_cuts_words")
+    region_height = region_bbox[3] - region_bbox[1]
+    if table["column_count"] <= 4 and table["row_count"] >= 8 and \
+            table["bbox"][3] - table["bbox"][1] > 0.25 * region_height and \
+            evidence["median_words_per_nonempty_cell"] >= 5:
+        reasons.append("prose_like_columns")
+    return reasons, evidence
+
+
+def mixed_image_evidence(table, boxes, images):
+    """Do not join a picture and its separate neighboring prose into one grid."""
+    b = table["bbox"]
+    area = (b[2] - b[0]) * (b[3] - b[1])
+    words = boxes_in_table(boxes, b)
+    if not words:
+        return []
+    for image in images:
+        bounds = [image.get(key) for key in ("x0", "top", "x1", "bottom")]
+        if any(value is None for value in bounds):
+            continue
+        x0, top, x1, bottom = bounds
+        overlap = max(0, min(b[2], x1) - max(b[0], x0)) * \
+                  max(0, min(b[3], bottom) - max(b[1], top))
+        if not 0.15 < overlap / area < 0.85:
+            continue
+        outside = sum(not (x0 <= (w[0] + w[2]) / 2 <= x1 and
+                           top <= (w[1] + w[3]) / 2 <= bottom) for w in words)
+        extends_sideways = b[0] < x0 - 20 or b[2] > x1 + 20
+        if extends_sideways and outside / len(words) > 0.3:
+            return ["layout_crosses_image_and_neighboring_prose"]
+    return []
+
+
+def contained_grid(inner, outer):
+    """A crop rediscovery is redundant only when its actual cell boxes agree."""
+    a, b = inner["bbox"], outer["bbox"]
+    if a[0] < b[0] - 1 or a[1] < b[1] - 1 or a[2] > b[2] + 1 or a[3] > b[3] + 1:
+        return False
+    return all(any(all(abs(x - y) <= 1 for x, y in zip(cell["bbox"], other["bbox"]))
+                   for other in outer["cells"]) for cell in inner["cells"])
+
+
+def same_table(first, second):
+    """Deduplicate substantially overlapping results, retaining earlier routes."""
+    a, b = first["bbox"], second["bbox"]
+    intersection = max(0, min(a[2], b[2]) - max(a[0], b[0])) * \
+                   max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    area_a, area_b = (a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1])
+    union = area_a + area_b - intersection
+    return (union > 0 and intersection / union >= 0.65) or contained_grid(second, first)
+
+
+def image_evidence(table, metadata, horizontal_rules, figure_context=None, *,
+                   require_repeated_rows=True):
+    """Reject graphic-dominated or weak tiny layout candidates; no OCR used."""
+    from .figure_quality import context_evidence, figure_evidence_reasons
+    pixel = dict(metadata.get("pixel_evidence", {}))
+    if figure_context is not None:
+        pixel["diagram_context"] = context_evidence(table["bbox"], figure_context)
+    b = table["bbox"]
+    width = b[2] - b[0]
+    # Use the same physical minimum as pixel-rule removal. A ruling must
+    # belong to this candidate, rather than a nearby header/axis or tiny
+    # image texture; partial tables still permit modest border overhang.
+    rule_support = any(
+        12 <= rule[2] - rule[0] <= 1.5 * width and
+        min(b[2], rule[2]) - max(b[0], rule[0]) >= 0.75 * width and
+        b[1] - 2 <= (rule[1] + rule[3]) / 2 <= b[3] + 2
+        for rule in horizontal_rules)
+    evidence = {"long_horizontal_rule_support": rule_support, "pixel": pixel}
+    reasons = figure_evidence_reasons(pixel)
+    if table.get("evidence", {}).get("long_prose_column_beside_short_cells") and not rule_support:
+        reasons.append("unruled_layout_includes_long_prose_column")
+    if table.get("evidence", {}).get("narrow_prose_gutters") and not rule_support:
+        reasons.append("unruled_columns_split_flowing_prose")
+    if pixel.get("status") == "ok":
+        if pixel.get("large_component_ink_fraction", 0) > 0.55 and \
+                pixel.get("character_component_ink_fraction", 0) < 0.35:
+            reasons.append("graphic_dominated_ink")
+        # A few aligned marks inside a figure are not enough to establish a
+        # borderless table. Real small ruled tables retain independent support.
+        if require_repeated_rows and table["row_count"] < 4 and not rule_support:
+            reasons.append("insufficient_repeated_layout_or_rules")
+    return reasons, evidence
+
+
+def detect_page(page, strategy="auto", bbox=None, tolerance=2.0, scan_dpi=144,
+                layout_dpi=200, line_settings=None):
+    region = page.crop(tuple(bbox)) if bbox else page
+    warnings, tables, attempts = [], [], []
+    boxes = None
+    image_attempted = False
+    diagnostics = {}
+    image_cache = {}
+
+    def sample_pixels(candidate_bbox):
+        sampler = image_cache.get("sample_candidate")
+        if sampler is None:
+            return {"status": "unavailable", "reason": "no_image_evidence_sampler"}
+        try:
+            return sampler(candidate_bbox)
+        except MemoryError:
+            raise
+        except Exception as exc:
+            return {"status": "unavailable", "reason": type(exc).__name__}
+
+    def ingest(groups, method, transform=None, backend_details=None):
+        nonlocal boxes
+        attempt = {"method": method, "raw_candidates": len(groups),
+                   "accepted": 0, "rejected": []}
+        for raw_index, raw in enumerate(groups):
+            candidate_metadata = None
+            try:
+                cells = raw.cells if method in ("lines", "text") else raw
+                if len(cells) > 4096:
+                    raise ValueError("cell_limit")
+                candidate = structure_from_cells(cells, method, min(tolerance, 1.0))
+            except (ValueError, TypeError):
+                attempt["rejected"].append({"reasons": ["invalid_or_oversize_cell_geometry"]})
+                continue
+            reasons = []
+            if candidate["row_count"] < 2 or candidate["column_count"] < 2:
+                reasons.append("single_row_or_column_candidate")
+            if candidate["row_count"] * candidate["column_count"] > 65536:
+                reasons.append("grid_area_limit")
+            b, bounds = candidate["bbox"], region.bbox
+            if b[0] < bounds[0] - 1 or b[1] < bounds[1] - 1 or \
+                    b[2] > bounds[2] + 1 or b[3] > bounds[3] + 1:
+                reasons.append("candidate_outside_selected_region")
+            if not reasons:
+                reasons.extend(check_grid(candidate))
+            if method == "native" and not backend_details:
+                reasons.append("native_envelope_unverified")
+            if method == "lines" and region.chars and not reasons and candidate["column_count"] >= 3:
+                try:
+                    from .layout_repair import repair_dense_word_rows, repair_shaded_word_rows
+                    if boxes is None:
+                        boxes = word_boxes_only(region)
+                    vertical = [[e[k] for k in ("x0", "top", "x1", "bottom")]
+                                for e in getattr(region, "vertical_edges", [])[:20000]]
+                    repair = repair_shaded_word_rows(candidate, boxes,
+                        getattr(region, "rects", []), getattr(region, "lines", []))
+                    if repair is None:
+                        repair = repair_dense_word_rows(candidate, boxes, vertical)
+                    if repair:
+                        cells, note = repair
+                        rebuilt = structure_from_cells(cells, method, min(tolerance, 1.0))
+                        cuts, evidence = text_evidence(rebuilt, boxes, region.bbox)
+                        if not check_grid(rebuilt) and not cuts:
+                            rebuilt["layout_repair"] = note
+                            rebuilt["evidence"] = evidence
+                            rebuilt["warnings"].append("dense_word_rows_require_review")
+                            candidate = rebuilt
+                except MemoryError:
+                    raise
+                except Exception as exc:
+                    warnings.append(f"dense_word_repair_failed:{type(exc).__name__}")
+            if method == "text" and not reasons:
+                if boxes is None:
+                    boxes = word_boxes_only(region)
+                table_words = boxes_in_table(boxes, candidate["bbox"])
+                collapse_text_gaps(candidate, table_words)
+                space_text_boundaries(candidate, boxes, region.bbox)
+                reasons.extend(check_grid(candidate))
+                if candidate["row_count"] < 2 or candidate["column_count"] < 2:
+                    reasons.append("single_row_or_column_after_text_normalization")
+            if method == "img2table" and region.chars and backend_details and not reasons:
+                metadata_list = backend_details.get("returned_group_metadata", [])
+                metadata = dict(metadata_list[raw_index]) if raw_index < len(metadata_list) else {}
+                image_reasons, evidence = image_evidence(candidate, metadata,
+                    backend_details.get("horizontal_rules", []), backend_details.get("figure_context"))
+                # Do not let a later normalization erase a measured rejection.
+                reasons.extend(image_reasons)
+                if not reasons and not evidence["long_horizontal_rule_support"] and \
+                        metadata.get("layout_repair", {}).get("status") != "repaired":
+                    if boxes is None:
+                        boxes = word_boxes_only(region)
+                    table_words = boxes_in_table(boxes, candidate["bbox"])
+                    if table_words:
+                        # Both unruled routes use the same word-gap correction;
+                        # image-derived cell boxes must not clip known words.
+                        space_text_boundaries(candidate, boxes, region.bbox)
+                        reasons.extend(check_grid(candidate))
+                        metadata.update(bbox=list(candidate["bbox"]),
+                                        pixel_evidence=sample_pixels(candidate["bbox"]))
+                        candidate["warnings"].append("native_word_boundaries_require_review")
+                # Metadata belongs to this candidate's final geometry, not to
+                # another raw fragment. Keep source provenance in the copy.
+                candidate_metadata = metadata
+            if method in ("text", "img2table", "native") and region.chars and not reasons:
+                if boxes is None:
+                    boxes = word_boxes_only(region)
+                evidence_reasons, evidence = text_evidence(candidate, boxes, region.bbox)
+                candidate["evidence"] = evidence
+                reasons.extend(evidence_reasons)
+                if method in ("text", "img2table"):
+                    reasons.extend(mixed_image_evidence(candidate, boxes, region.images))
+            if method == "text" and not reasons:
+                # Text alignment must not bypass the same figure/prose checks
+                # already applied to inferred image grids. Context is measured
+                # against this candidate, not copied from a rejected fragment.
+                details = diagnostics.get("img2table_detection", {})
+                pixel = sample_pixels(candidate["bbox"])
+                # Native printed rules remain valid even if the optional
+                # image pass fails, returns empty hints, or misses this region.
+                rules = [[e[k] for k in ("x0", "top", "x1", "bottom")]
+                         for e in getattr(region, "horizontal_edges", [])[:20000]]
+                rules = (rules + details.get("horizontal_rules", []))[:20000]
+                image_reasons, evidence = image_evidence(candidate, {"pixel_evidence": pixel},
+                    rules, details.get("figure_context"), require_repeated_rows=False)
+                candidate.setdefault("evidence", {}).update(evidence)
+                reasons.extend(image_reasons)
+            if method in ("img2table", "native", "scan_recovery") and backend_details and not reasons:
+                group_metadata = backend_details.get("returned_group_metadata", [])
+                metadata = candidate_metadata if candidate_metadata is not None else \
+                    (group_metadata[raw_index] if raw_index < len(group_metadata) else {})
+                if method == "native" and not metadata.get("complete_envelope"):
+                    reasons.append("native_envelope_unverified")
+                if metadata.get("layout_repair", {}).get("status") == "repaired":
+                    candidate["layout_repair"] = metadata["layout_repair"]
+                    candidate["warnings"].append("rule_anchored_layout_repair_requires_review")
+                if method == "native":
+                    candidate["native_evidence"] = metadata
+                else:
+                    image_reasons, evidence = image_evidence(candidate, metadata,
+                        backend_details.get("horizontal_rules", []), backend_details.get("figure_context"))
+                    candidate.setdefault("evidence", {}).update(evidence)
+                    reasons.extend(image_reasons)
+            if reasons:
+                attempt["rejected"].append({"bbox": candidate["bbox"],
+                                            "reasons": sorted(set(reasons))})
+                continue
+            if method in ("raster", "img2table", "native", "scan_recovery"):
+                from .raster_structure import map_to_original
+                if transform:
+                    map_to_original(candidate, transform)
+                candidate["warnings"].append(f"experimental_{method}_detection_requires_review")
+            expansions = [old for old in tables if contained_grid(old, candidate) and
+                          not contained_grid(candidate, old)]
+            if method == "native" and candidate.get("native_evidence", {}).get("complete_envelope"):
+                # A verified native envelope can include unruled body rows that
+                # were absent from a small closed vector fragment. Its new cell
+                # partition need not preserve the fragment's accidental grid.
+                for old in tables:
+                    a, b = old["bbox"], candidate["bbox"]
+                    old_area = (a[2] - a[0]) * (a[3] - a[1])
+                    new_area = (b[2] - b[0]) * (b[3] - b[1])
+                    overlap = max(0, min(a[2], b[2]) - max(a[0], b[0])) * \
+                              max(0, min(a[3], b[3]) - max(a[1], b[1]))
+                    if old["method"] == "lines" and overlap >= .95 * old_area and \
+                            new_area >= 1.2 * old_area and old not in expansions:
+                        expansions.append(old)
+            if any(same_table(accepted, candidate) for accepted in tables if accepted not in expansions):
+                attempt["rejected"].append({"bbox": candidate["bbox"],
+                                            "reasons": ["duplicate_of_preferred_candidate"]})
+                continue
+            # Prefer a fuller result over an earlier fragment only when the
+            # original cell rectangles are preserved exactly in the new grid.
+            tables[:] = [old for old in tables if old not in expansions]
+            candidate["review_status"] = "unreviewed"
+            tables.append(candidate)
+            attempt["accepted"] += 1
+        attempts.append(attempt)
+
+    def vector(method):
+        settings = {"vertical_strategy": method, "horizontal_strategy": method,
+                    "snap_tolerance": tolerance, "join_tolerance": tolerance,
+                    "intersection_tolerance": tolerance}
+        if method == "lines" and line_settings:
+            settings.update(line_settings)
+        try:
+            geometry = region
+            if method == "lines":
+                try:
+                    geometry, details = vector_geometry_region(region)
+                    diagnostics["vector_fill_cleanup"] = details
+                except MemoryError:
+                    raise
+                except Exception as exc:
+                    diagnostics["vector_fill_cleanup"] = {"status": "unavailable",
+                        "error_type": type(exc).__name__}
+                    warnings.append(f"vector_fill_cleanup_failed:{type(exc).__name__}")
+            ingest(geometry.find_tables(settings), method)
+        except MemoryError:
+            raise
+        except Exception as exc:
+            details = {"method": method, "status": "failed", "raw_candidates": 0,
+                       "accepted": 0, "rejected": [], "error_type": type(exc).__name__}
+            attempts.append(details)
+            warnings.append(f"{method}_backend_failed:{type(exc).__name__}")
+
+    def native():
+        try:
+            from .native_structure import page_grids
+            groups, details = page_grids(region)
+            diagnostics["native_detection"] = details
+            warnings.extend(details.get("warnings", []))
+            ingest(groups, "native", backend_details=details)
+        except MemoryError:
+            raise
+        except Exception as exc:
+            warnings.append(f"native_backend_failed:{type(exc).__name__}")
+            diagnostics["native_detection"] = {"status": "failed", "error_type": type(exc).__name__}
+            attempts.append({"method": "native", "status": "failed", "raw_candidates": 0,
+                             "accepted": 0, "rejected": [], "error_type": type(exc).__name__})
+
+    def image_backend(method, dpi):
+        nonlocal image_attempted, boxes
+        image_attempted = True
+        try:
+            if method == "raster":
+                from .raster_structure import page_grids
+            else:
+                from .img2table_structure import page_grids
+            kwargs = {"evidence_cache": image_cache} if method == "img2table" else {}
+            groups, transform, details = page_grids(region, dpi=dpi, tolerance=tolerance, **kwargs)
+            if method == "img2table" and region.chars and groups:
+                try:
+                    from .layout_repair import repair_word_groups
+                    if boxes is None:
+                        boxes = word_boxes_only(region)
+                    repaired, notes = repair_word_groups(groups, details.get("horizontal_rules", []), boxes)
+                    old_metadata = details.get("returned_group_metadata", [])
+                    new_metadata = []
+                    for cells, note in zip(repaired, notes):
+                        source_index = note["source_group_indices"][0]
+                        item = dict(old_metadata[source_index]) if source_index < len(old_metadata) else {}
+                        if note["status"] == "repaired":
+                            item.update(bbox=note["bbox"], unique_cells=len(cells), layout_repair=note,
+                                pixel_evidence=sample_pixels(note["bbox"]))
+                        new_metadata.append(item)
+                    groups = repaired
+                    details["returned_group_metadata"] = new_metadata
+                    details["returned_tables"] = len(groups)
+                    details["unique_cells"] = sum(len(group) for group in groups)
+                    details["native_layout_repaired_tables"] = sum(note["status"] == "repaired" for note in notes)
+                except MemoryError:
+                    raise
+                except Exception as exc:
+                    warnings.append(f"native_layout_repair_failed:{type(exc).__name__}")
+            diagnostics[f"{method}_detection"] = details
+            warnings.extend(details.get("warnings", []))
+            ingest(groups, method, transform, details)
+            if method == "img2table" and details.get("figure_context"):
+                # Reuse the page's image context to review earlier raster grids.
+                # Diagram boxes can form closed cells even though they are not
+                # a table. No extra render is needed for this second check.
+                from .figure_quality import context_evidence, figure_evidence_reasons
+                removed = []
+                for table in list(tables):
+                    if table["method"] != "raster":
+                        continue
+                    evidence = context_evidence(table["bbox"], details["figure_context"])
+                    reasons = figure_evidence_reasons({"diagram_context": evidence})
+                    if reasons:
+                        tables.remove(table)
+                        rejected = {"bbox": table["bbox"], "reasons": reasons,
+                                    "stage": "page_figure_context"}
+                        removed.append(rejected)
+                        for attempt in attempts:
+                            if attempt["method"] == "raster":
+                                attempt["accepted"] = max(0, attempt["accepted"] - 1)
+                                attempt["rejected"].append(rejected)
+                diagnostics["raster_context_review"] = {"rejected": removed,
+                    "retained": sum(t["method"] == "raster" for t in tables)}
+        except MemoryError:
+            raise
+        except Exception as exc:
+            code = f"{method}_backend_failed:{type(exc).__name__}"
+            diagnostics[f"{method}_detection"] = {"status": "failed", "warnings": [code]}
+            attempts.append({"method": method, "status": "failed", "raw_candidates": 0,
+                             "accepted": 0, "rejected": [], "error_type": type(exc).__name__})
+            warnings.append(code)
+
+    if strategy in ("auto", "lines", "text"):
+        vector("text" if strategy == "text" else "lines")
+    if strategy == "native" or (strategy == "auto" and region.chars):
+        native()
+    if strategy == "raster" or (strategy == "auto" and region.images):
+        image_backend("raster", scan_dpi)
+    # Accepted candidates, not raw fragments, determine fallback. Image-containing
+    # mixed pages also get layout detection so a valid vector table cannot hide
+    # another scanned/partially ruled table elsewhere on the page.
+    if strategy == "img2table" or (strategy == "auto" and (not tables or region.images)):
+        image_backend("img2table", layout_dpi)
+    if strategy == "auto" and not tables and region.images and not region.chars:
+        rules = diagnostics.get("img2table_detection", {}).get("horizontal_rules", [])
+        if rules:
+            try:
+                from .scan_recovery import recover_ruled_groups
+                groups, details = recover_ruled_groups(region, rules, dpi=layout_dpi)
+                context = diagnostics.get("img2table_detection", {}).get("figure_context")
+                if context is not None:
+                    details["figure_context"] = context
+                diagnostics["scan_recovery"] = details
+                warnings.extend(details.get("warnings", []))
+                ingest(groups, "scan_recovery", backend_details=details)
+            except MemoryError:
+                raise
+            except Exception as exc:
+                warnings.append(f"scan_recovery_failed:{type(exc).__name__}")
+    if strategy == "auto" and not tables and region.chars:
+        vector("text")
+    if strategy == "auto" and tables and not region.images and \
+            all(t["method"] in ("lines", "native") for t in tables):
+        warnings.append("additional_borderless_regions_not_searched")
+    if region.images and not image_attempted:
+        warnings.append("use_auto_or_img2table_for_image_content")
+    if not tables:
+        warnings.append("no_table_candidates_accepted")
+    tables.sort(key=lambda t: (t["bbox"][1], t["bbox"][0]))
+    for index, table in enumerate(tables, 1):
+        table["id"] = f"p{page.page_number:03d}_t{index:02d}"
+    for attempt in attempts:
+        attempt["retained"] = sum(t["method"] == attempt["method"] for t in tables)
+    return {"page": page.page_number, "width": page.width, "height": page.height,
+            "page_bbox": list(page.bbox), "rotation": page.rotation,
+            "status": "candidates_detected" if tables else
+                ("needs_fallback" if image_attempted and region.images else "no_candidates"),
+            "tables": tables, "warnings": sorted(set(warnings)),
+            "detection_attempts": attempts, **diagnostics}

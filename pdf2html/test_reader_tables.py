@@ -31,9 +31,11 @@ class TableTests(unittest.TestCase):
     def test_uncertain_headers_keep_source_text(self):
         report = []
         soup = BeautifulSoup(extract_article(self.make_pdf(False), table_report=report), 'html.parser')
-        self.assertIsNone(soup.table)
+        self.assertIsNotNone(soup.table)
+        self.assertEqual(soup.table.select("thead,th"), [])
+        self.assertEqual([c.text for c in soup.table.tr.select("td")], ["Group", "Value"])
         self.assertIn('-1.25', soup.get_text())
-        self.assertTrue(any(item['status'] == 'needs_review' for item in report))
+        self.assertEqual(soup.table.get('data-local-header-status'), 'unconfirmed')
 
 
 if __name__ == '__main__':

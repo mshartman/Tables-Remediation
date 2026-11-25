@@ -1,0 +1,700 @@
+"""Conservative rule-anchored repair of partially ruled table geometry.
+
+Inputs are rectangles and printed rules in PDF points. No text recognition or
+lexical content is used. A repair needs two compatible header rules, at least
+three repeated body records, and supported column separators. Ambiguous cases
+keep the original candidates.
+"""
+from __future__ import annotations
+
+import statistics
+from collections import Counter
+
+MAX_REPAIR_CLUSTERS = 64
+MAX_COMPONENTS = 20_000
+
+
+def repair_shaded_word_rows(table, words, rectangles, lines=()):
+    """Recover a narrow shaded-grid pattern without deleting empty fields.
+
+    Require two header tiers with a tall label cell, labeled grouped fields,
+    one narrow unlabeled paint spacer, repeated full-width section shading,
+    and aligned data rows. Actual strokes and ambiguous layouts are preserved.
+    """
+    columns = table["column_count"]
+    if not 4 <= columns <= 32 or table["row_count"] < 10 or len(words) > MAX_COMPONENTS or \
+            not rectangles or len(rectangles) > 1000 or len(lines) > 6000:
+        return None
+    xs, ys = table["x_boundaries"], table["y_boundaries"]
+    if not any(c["row"] == 0 and c["column"] == 0 and c["row_span"] == 2 and
+               c["column_span"] == 1 for c in table["cells"]):
+        return None
+    if sum(c["row"] == 0 and c["column_span"] > 1 for c in table["cells"]) < 2:
+        return None
+    if any(xs[0] + 1 < (r["x0"] + r["x1"]) / 2 < xs[-1] - 1 and
+           ys[0] < (r["top"] + r["bottom"]) / 2 < ys[-1] for r in lines):
+        return None
+    if any(r.get("stroke") and max(r["x0"], xs[0]) < min(r["x1"], xs[-1]) and
+           max(r["top"], ys[0]) < min(r["bottom"], ys[-1]) for r in rectangles):
+        return None
+    local = [w for w in words if xs[0] <= (w[0] + w[2]) / 2 <= xs[-1] and
+             ys[0] <= (w[1] + w[3]) / 2 < ys[-1]]
+    if not local:
+        return None
+    height = statistics.median(w[3] - w[1] for w in local)
+    terminal = [c for c in table["cells"] if c["row"] == table["row_count"] - 1]
+    if len(terminal) != 1 or terminal[0]["row_span"] != 1 or terminal[0]["column_span"] != columns:
+        return None
+    data_bottom = ys[-2]
+    header = [w for w in local if (w[1] + w[3]) / 2 < ys[2]]
+    body = [w for w in local if ys[2] <= (w[1] + w[3]) / 2 < data_bottom]
+    candidates = []
+    for col in range(1, columns - 1):
+        width = xs[col + 1] - xs[col]
+        others = [b - a for i, (a, b) in enumerate(zip(xs, xs[1:])) if i != col]
+        if width <= .25 * statistics.median(others) and width <= 1.2 * height and \
+                not any(xs[col] <= (w[0] + w[2]) / 2 < xs[col + 1] for w in header + body):
+            candidates.append(col)
+    if len(candidates) != 1:
+        return None
+    spacer = candidates[0]
+    # The spacer must be independently blank in BOTH printed header tiers.
+    if not all(any(c["row"] == row and c["column"] == spacer and
+                   c["row_span"] == c["column_span"] == 1 for c in table["cells"])
+               for row in (0, 1)):
+        return None
+    updated_xs = xs[:spacer] + [(xs[spacer] + xs[spacer + 1]) / 2] + xs[spacer + 2:]
+    if not all(any(a <= (w[0] + w[2]) / 2 < b for w in header)
+               for a, b in zip(updated_xs, updated_xs[1:])):
+        return None
+
+    def band_color(top, bottom):
+        by_color = {}
+        for rect in rectangles:
+            if not rect.get("fill") or rect.get("stroke") or \
+                    abs(rect["top"] - top) > 1 or abs(rect["bottom"] - bottom) > 1:
+                continue
+            value = rect.get("non_stroking_color")
+            color = (value,) if isinstance(value, (int, float)) else \
+                tuple(value) if isinstance(value, (tuple, list)) else None
+            if color is None or len(color) not in (1, 3, 4):
+                continue
+            nonwhite = any(v > .01 for v in color) if len(color) == 4 else any(v < .99 for v in color)
+            if not nonwhite:
+                continue
+            left, right = max(xs[0], rect["x0"]), min(xs[-1], rect["x1"])
+            if left < right:
+                by_color.setdefault(color, []).append([left, 0, right, 1])
+        covering = [color for color, boxes in by_color.items()
+                    if sum(b - a for a, b in _runs(boxes, 1)) >= .95 * (xs[-1] - xs[0])]
+        return covering[0] if len(covering) == 1 else None
+
+    sections, data_rows, section_colors = [], [], []
+    for row in range(2, table["row_count"] - 1):
+        top, bottom = ys[row:row + 2]
+        ink = [w for w in body if top <= (w[1] + w[3]) / 2 < bottom]
+        row_lines, _, _ = _lines(ink, minimum_boxes=1)
+        if len(row_lines) != 1:
+            return None
+        occupied = [col for col, (a, b) in enumerate(zip(updated_xs, updated_xs[1:]))
+                    if any(a <= (w[0] + w[2]) / 2 < b for w in ink)]
+        color = band_color(top, bottom)
+        if occupied == [0] and color is not None:
+            sections.append(row)
+            section_colors.append(color)
+        elif len(occupied) >= 3 and occupied[0] == 0:
+            if any(w[0] < x - .75 and w[2] > x + .75 for w in ink for x in updated_xs[1:-1]):
+                return None
+            data_rows.append(row)
+        else:
+            return None
+    if len(sections) < 3 or len(data_rows) < 6 or len(set(section_colors)) != 1:
+        return None
+    # A distinct full-width terminal band with flowing small text is not an
+    # additional data record. Require a printed rule at the body boundary.
+    note_words = [w for w in local if (w[1] + w[3]) / 2 >= data_bottom]
+    note_lines, _, note_height = _lines(note_words, minimum_boxes=1)
+    note_color = band_color(data_bottom, ys[-1])
+    boundary_rules = [r for r in rectangles if (r.get("fill") or r.get("stroke")) and
+        0 < r["bottom"] - r["top"] <= 1 and
+        abs((r["top"] + r["bottom"]) / 2 - data_bottom) <= 1 and
+        min(r["x1"], xs[-1]) > max(r["x0"], xs[0])]
+    ruled_width = sum(b - a for a, b in _runs([[max(xs[0], r["x0"]), 0,
+        min(xs[-1], r["x1"]), 1] for r in boundary_rules], 1))
+    note_runs = _runs(note_words, max(2, height * .5))
+    if ruled_width < .95 * (xs[-1] - xs[0]) or len(note_lines) < 2 or note_height >= height or \
+            note_color is None or note_color in section_colors or len(note_runs) != 1 or \
+            sum(note_runs[0][0] < x < note_runs[0][1] for x in updated_xs[1:-1]) < 2:
+        return None
+    cells = []
+    def boundary_index(index):
+        return index if index <= spacer else index - 1
+    for cell in table["cells"]:
+        if cell["row"] >= 2:
+            continue
+        a, b = cell["column"], cell["column"] + cell["column_span"]
+        left, right = boundary_index(a), boundary_index(b)
+        if left < right:
+            cells.append((updated_xs[left], cell["bbox"][1], updated_xs[right], cell["bbox"][3]))
+    for row in range(2, table["row_count"] - 1):
+        top, bottom = ys[row:row + 2]
+        if row in sections:
+            cells.append((updated_xs[0], top, updated_xs[-1], bottom))
+        else:
+            cells.extend((a, top, b, bottom) for a, b in zip(updated_xs, updated_xs[1:]))
+    if len(cells) > 4096:
+        return None
+    return cells, {"status": "repaired", "basis": "shaded_header_fields_and_repeated_row_bands",
+        "original_row_count": table["row_count"], "original_column_count": columns,
+        "columns": columns - 1, "section_rows": sections, "body_records": len(data_rows),
+        "removed_spacer_column": spacer, "excluded_terminal_note_bbox":
+            [xs[0], data_bottom, xs[-1], ys[-1]], "bbox": [xs[0], ys[0], xs[-1], data_bottom],
+        "semantic_structure_verified": False}
+
+
+def repair_dense_word_rows(table, words, vertical_rules=()):
+    """Recover repeated records in supported dense ruled body layouts.
+
+    Full-width bands require prior column partitions and independent aligned
+    record fields. Multi-column bands require several consecutive repetitions
+    of compact aligned fields. No word meanings or document labels are used.
+    """
+    if not 3 <= table["column_count"] <= 32 or len(words) > MAX_COMPONENTS:
+        return None
+    xs, ys = table["x_boundaries"], table["y_boundaries"]
+    width = xs[-1] - xs[0]
+    replacements, notes = {}, []
+
+    def aligned(values, tolerance):
+        values = sorted(values)
+        first = best = 0
+        for last, value in enumerate(values):
+            while value - values[first] > tolerance:
+                first += 1
+            best = max(best, last - first + 1)
+        return best >= .8 * len(values)
+
+    for cell in table["cells"]:
+        row = cell["row"]
+        if row == 0 or cell["row_span"] != 1 or cell["column"] != 0 or \
+                cell["column_span"] != table["column_count"]:
+            continue
+        top, bottom = ys[row:row + 2]
+        # Every logical column must already be represented by a separate cell
+        # above this band. A page box or title cannot supply that evidence.
+        if not all(any(c["column"] == col and c["column_span"] == 1 and
+                       c["row"] + c["row_span"] <= row for c in table["cells"])
+                   for col in range(table["column_count"])):
+            continue
+        local = [w for w in words if xs[0] <= (w[0] + w[2]) / 2 <= xs[-1] and
+                 top <= (w[1] + w[3]) / 2 < bottom]
+        lines, _, height = _lines(local, minimum_boxes=1)
+        if not 4 <= len(lines) <= 200 or height <= 0 or bottom - top < 6 * height:
+            continue
+        fields = [[[w for w in line if a <= (w[0] + w[2]) / 2 < b]
+                    for a, b in zip(xs, xs[1:])] for line in lines]
+        occupancy = [frozenset(c for c, values in enumerate(line) if values) for line in fields]
+        patterns = Counter(occupancy)
+        largest = max(map(len, patterns))
+        signatures = [pattern for pattern in patterns if len(pattern) == largest]
+        if len(signatures) != 1 or largest < 3:
+            continue
+        signature = signatures[0]
+        anchors = [i for i, pattern in enumerate(occupancy) if pattern == signature]
+        if len(anchors) < 4 or anchors[0] != 0:
+            continue
+        first_col, last_col = min(signature), max(signature)
+        if any(not pattern <= signature or (i not in anchors and
+                (first_col in pattern or len(pattern) > .5 * len(signature)))
+               for i, pattern in enumerate(occupancy)):
+            continue
+        last_fields = [fields[i][last_col] for i in anchors]
+        if any(len(values) != 1 for values in last_fields) or \
+                xs[last_col + 1] - xs[last_col] > .2 * width:
+            continue
+        if statistics.median(values[0][2] - values[0][0] for values in last_fields) > \
+                .7 * (xs[last_col + 1] - xs[last_col]):
+            continue
+        if not aligned([values[0][2] for values in last_fields], max(.5, .15 * height)) or \
+                not aligned([min(w[0] for w in fields[i][first_col]) for i in anchors],
+                            max(.5, .15 * height)):
+            continue
+        records = [sum(lines[a:b], []) for a, b in zip(anchors, anchors[1:] + [len(lines)])]
+        cuts = [(max(w[3] for w in a) + min(w[1] for w in b)) / 2
+                for a, b in zip(records, records[1:])]
+        row_bounds = [top] + cuts + [bottom]
+        if any(b - a < 3 for a, b in zip(row_bounds, row_bounds[1:])) or \
+                any(w[1] < y < w[3] for w in local for y in cuts):
+            continue
+        # Printed header edges can be a little text-tight, but never accept
+        # repeated field cuts as a consequence of restoring columns.
+        cut_words = sum(any(w[0] < x - .75 and w[2] > x + .75 for x in xs[1:-1])
+                        for w in local)
+        if cut_words / max(1, len(local)) > .02:
+            continue
+        replacements[cell["id"]] = [(a, c, b, d) for c, d in zip(row_bounds, row_bounds[1:])
+                                     for a, b in zip(xs, xs[1:])]
+        notes.append({"original_row": row, "body_records": len(records),
+                      "physical_lines": len(lines), "occupied_columns": sorted(signature)})
+    if not replacements:
+        return _repair_dense_column_bands(table, words, vertical_rules)
+    cells = [box for cell in table["cells"] for box in replacements.get(cell["id"], [cell["bbox"]])]
+    if len(cells) > 4096:
+        return None
+    return cells, {"status": "repaired", "basis": "printed_columns_and_repeated_word_records",
+        "bbox": list(table["bbox"]), "original_row_count": table["row_count"],
+        "columns": table["column_count"], "split_bands": notes,
+        "semantic_structure_verified": False}
+
+
+def _repair_dense_column_bands(table, words, vertical_rules):
+    """Split repeated compact records within several consecutive ruled bands.
+
+    This separate pattern requires dense, single-token fields and a recurring
+    row pitch. A single wrapped row or paragraph does not establish it. Empty
+    columns remain in the printed grid. Optional lower-tier header dividers
+    must be supported by physical vertical rule segments.
+    """
+    columns = table["column_count"]
+    if columns < 6 or len(table["cells"]) > 4096:
+        return None
+    xs, ys = table["x_boundaries"], table["y_boundaries"]
+    candidates = {}
+    for row in range(1, table["row_count"]):
+        cells = [c for c in table["cells"] if c["row"] == row]
+        if len(cells) != columns or any(c["row_span"] != 1 or c["column_span"] != 1 for c in cells):
+            continue
+        top, bottom = ys[row:row + 2]
+        local = [w for w in words if xs[0] <= (w[0] + w[2]) / 2 <= xs[-1] and
+                 top <= (w[1] + w[3]) / 2 < bottom]
+        lines, _, height = _lines(local, minimum_boxes=1)
+        if not 3 <= len(lines) <= 100 or height <= 0:
+            continue
+        fields = [[[w for w in line if a <= (w[0] + w[2]) / 2 < b]
+                   for a, b in zip(xs, xs[1:])] for line in lines]
+        patterns = [frozenset(i for i, field in enumerate(line) if field) for line in fields]
+        signature = patterns[0]
+        if len(signature) < .75 * columns or 0 not in signature or columns - 1 not in signature or \
+                any(p != signature for p in patterns):
+            continue
+        compact = [col for col in signature if all(len(line[col]) == 1 for line in fields)]
+        if len(compact) < .75 * len(signature):
+            continue
+        # Every compact field must line up at its left or right edge; flowing
+        # prose spread over several columns does not supply this evidence.
+        if any(min(max(line[col][0][edge] for line in fields) -
+                   min(line[col][0][edge] for line in fields) for edge in (0, 2)) >
+               max(.5, .15 * height) for col in compact):
+            continue
+        starts = [min(w[1] for w in line) for line in lines]
+        pitches = [b - a for a, b in zip(starts, starts[1:])]
+        pitch = statistics.median(pitches)
+        if not height < pitch < 2 * height or max(pitches) - min(pitches) > .15 * height:
+            continue
+        cuts = [(max(w[3] for w in a) + min(w[1] for w in b)) / 2
+                for a, b in zip(lines, lines[1:])]
+        if any(w[1] < y < w[3] for w in local for y in cuts) or \
+                any(w[0] < x - .75 and w[2] > x + .75 for w in local for x in xs[1:-1]):
+            continue
+        boundaries = [top] + cuts + [bottom]
+        if min(b - a for a, b in zip(boundaries, boundaries[1:])) < 3:
+            continue
+        candidates[row] = {"height": height, "pitch": pitch, "signature": signature,
+                           "boundaries": boundaries, "records": len(lines)}
+    runs = []
+    for row, item in candidates.items():
+        if runs and row == runs[-1][-1] + 1 and \
+                item["signature"] == candidates[runs[-1][-1]]["signature"] and \
+                abs(item["pitch"] - candidates[runs[-1][-1]]["pitch"]) <= .15 * item["height"]:
+            runs[-1].append(row)
+        else:
+            runs.append([row])
+    runs = [run for run in runs if len(run) >= 3]
+    if not runs:
+        return None
+    split_rows = {r for run in runs for r in run}
+    cells = [c["bbox"] for c in table["cells"] if c["row"] not in split_rows]
+    for row in sorted(split_rows):
+        row_edges = candidates[row]["boundaries"]
+        cells.extend((a, top, b, bottom) for top, bottom in zip(row_edges, row_edges[1:])
+                     for a, b in zip(xs, xs[1:]))
+    note = {"status": "repaired", "basis": "printed_columns_and_repeated_dense_bands",
+            "original_row_count": table["row_count"], "columns": columns,
+            "split_bands": [{"original_row": r, "body_records": candidates[r]["records"],
+                              "occupied_columns": sorted(candidates[r]["signature"])}
+                             for r in sorted(split_rows)], "semantic_structure_verified": False}
+
+    # A header spanning several columns may contain a lower tier whose short
+    # printed dividers never formed closed cells in the original vector grid.
+    first = min(split_rows)
+    header_row = first - 1
+    header = [c for c in table["cells"] if c["row"] == header_row]
+    if header and all(c["row_span"] == 1 for c in header):
+        top, bottom = ys[header_row:first + 1]
+        needed = sorted({i for c in header if c["column_span"] > 1
+                         for i in range(c["column"] + 1, c["column"] + c["column_span"])})
+        starts = []
+        for i in needed:
+            matches = [r for r in vertical_rules[:20000] if abs(r[0] - xs[i]) <= 1 and
+                       abs(r[2] - xs[i]) <= 1 and top + 3 < r[1] < bottom - 3 and
+                       r[3] >= bottom - 1]
+            if matches:
+                starts.append(min(r[1] for r in matches))
+        if len(needed) >= 3 and len(starts) == len(needed) and max(starts) - min(starts) <= 1:
+            division = statistics.median(starts)
+            ink = [w for w in words if xs[0] <= (w[0] + w[2]) / 2 <= xs[-1] and
+                   top <= (w[1] + w[3]) / 2 < bottom]
+            upper = [w for w in ink if w[3] <= division]
+            lower = [w for w in ink if w[1] >= division]
+            if upper and lower and len(upper) + len(lower) == len(ink) and \
+                    not any(w[0] < x - .75 and w[2] > x + .75 for w in lower for x in xs[1:-1]):
+                original_boxes = {tuple(c["bbox"]) for c in header}
+                cells = [b for b in cells if tuple(b) not in original_boxes]
+                for c in header:
+                    a, b = c["column"], c["column"] + c["column_span"]
+                    if b - a == 1:
+                        cells.append(tuple(c["bbox"]))
+                    else:
+                        cells.append((xs[a], top, xs[b], division))
+                        cells.extend((xs[i], division, xs[i + 1], bottom) for i in range(a, b))
+                note["header_tier_divider"] = division
+
+    # Limit footnote exclusion to a terminal, full-width block separated by an
+    # empty printed band after a complete data row. Ordinary trailing summary
+    # rows, populated spacer bands and interior notes remain in the grid.
+    last = max(split_rows)
+    total_row, spacer_row = last + 1, last + 2
+    total = [c for c in table["cells"] if c["row"] == total_row]
+    tail = [c for c in table["cells"] if c["row"] >= spacer_row]
+    if len(total) == columns and all(c["row_span"] == c["column_span"] == 1 for c in total) and \
+            tail and all(c["row_span"] == 1 and c["column_span"] == columns for c in tail):
+        boundary = ys[spacer_row]
+        spacer_bottom = ys[spacer_row + 1]
+        total_ink = [w for w in words if xs[0] <= (w[0] + w[2]) / 2 <= xs[-1] and
+                     ys[total_row] <= (w[1] + w[3]) / 2 < boundary]
+        total_lines, _, _ = _lines(total_ink, minimum_boxes=1)
+        total_fields = [[w for w in total_ink if a <= (w[0] + w[2]) / 2 < b]
+                        for a, b in zip(xs, xs[1:])]
+        complete_total = len(total_lines) == 1 and \
+            sum(len(field) == 1 for field in total_fields) >= .75 * columns
+        empty = not any(xs[0] <= (w[0] + w[2]) / 2 <= xs[-1] and
+                        boundary <= (w[1] + w[3]) / 2 < spacer_bottom for w in words)
+        tail_words = [w for w in words if xs[0] <= (w[0] + w[2]) / 2 <= xs[-1] and
+                      spacer_bottom <= (w[1] + w[3]) / 2 < ys[-1]]
+        tail_lines, _, _ = _lines(tail_words, minimum_boxes=1)
+        if complete_total and empty and spacer_bottom - boundary >= .75 * candidates[last]["height"] and \
+                len(tail_lines) >= 2 and sum(any(w[0] < x - .75 and w[2] > x + .75
+                    for x in xs[1:-1]) for w in tail_words) >= 3:
+            cells = [b for b in cells if b[3] <= boundary + .001]
+            note["excluded_terminal_note_bbox"] = [xs[0], boundary, xs[-1], ys[-1]]
+    if len(cells) > 4096:
+        return None
+    note["bbox"] = bounds(cells)
+    return cells, note
+
+
+def bounds(boxes):
+    return [min(b[0] for b in boxes), min(b[1] for b in boxes),
+            max(b[2] for b in boxes), max(b[3] for b in boxes)]
+
+
+def _overlap(a, b):
+    return max(0, min(a[2], b[2]) - max(a[0], b[0]))
+
+
+def _clusters(groups):
+    clusters = []
+    for index, group in enumerate(groups):
+        box = bounds(group)
+        matches = [c for c in clusters if _overlap(box, c["bbox"]) >=
+                   .7 * min(box[2] - box[0], c["bbox"][2] - c["bbox"][0]) and
+                   max(box[1], c["bbox"][1]) - min(box[3], c["bbox"][3]) <= 12]
+        if matches:
+            members = [index] + [i for c in matches for i in c["indices"]]
+            clusters = [c for c in clusters if c not in matches]
+            box = bounds([box] + [c["bbox"] for c in matches])
+        else:
+            members = [index]
+        clusters.append({"indices": sorted(members), "bbox": box})
+    return clusters
+
+
+def _lines(boxes, minimum_boxes=3):
+    if not boxes:
+        return [], 0, 0
+    height = statistics.median(b[3] - b[1] for b in boxes)
+    width = statistics.median(b[2] - b[0] for b in boxes)
+    lines = []
+    for box in sorted(boxes, key=lambda b: (b[1] + b[3]) / 2):
+        center = (box[1] + box[3]) / 2
+        if lines and abs(center - statistics.median((b[1] + b[3]) / 2
+                                                    for b in lines[-1])) < height * .6:
+            lines[-1].append(box)
+        else:
+            lines.append([box])
+    return [line for line in lines if len(line) >= minimum_boxes], width, height
+
+
+def _runs(boxes, gap):
+    runs = []
+    for box in sorted(boxes):
+        if runs and box[0] - runs[-1][1] < gap:
+            runs[-1][1] = max(runs[-1][1], box[2])
+        else:
+            runs.append([box[0], box[2]])
+    return runs
+
+
+def _repair(cluster, groups, horizontal, vertical, read_components):
+    seed = cluster["bbox"]
+    width = seed[2] - seed[0]
+    rules = [r for r in horizontal if r[2] - r[0] >= max(75, width * .8) and
+             _overlap(r, seed) >= .8 * width and
+             seed[1] - 50 <= r[1] <= seed[3] + 12]
+    rules.sort(key=lambda r: r[1])
+    unique = []
+    for rule in rules:
+        if unique and rule[1] - unique[-1][1] < 3:
+            continue
+        unique.append(rule)
+    if len(unique) < 2:
+        return None
+    top, separator = unique[:2]
+    if not (6 <= separator[1] - top[1] <= 65 and
+            top[1] <= seed[1] + min(25, .4 * (seed[3] - seed[1])) and
+            separator[1] < seed[3] - 15):
+        return None
+    left, right = max(top[0], separator[0]), min(top[2], separator[2])
+    if right - left > width * 1.7 or right <= left:
+        return None
+    bottom_rules = [r for r in unique[2:] if r[1] >= seed[3] - 20 and
+                    _overlap(r, [left, 0, right, 0]) >= .95 * (right - left)]
+    bottom = bottom_rules[0][1] if bottom_rules else seed[3] + 3
+    # A fully ruled body already supplies stronger evidence than this repair.
+    if any(left - 2 <= v[0] <= right + 2 and
+           min(v[3], bottom) - max(v[1], separator[1]) > 4
+           for v in vertical):
+        return None
+    area = [left, top[1], right, bottom]
+    components = read_components(area)
+    if not components or len(components) > MAX_COMPONENTS:
+        return None
+    header = [b for b in components if top[1] + 1 < (b[1] + b[3]) / 2 < separator[1] - 1]
+    body = [b for b in components if separator[1] + 1 < (b[1] + b[3]) / 2 < bottom - 1]
+    body_lines, char_width, char_height = _lines(body)
+    header_lines, _, _ = _lines(header)
+    if not 3 <= len(body_lines) <= 200 or not 1 <= len(header_lines) <= 6 or char_width <= 0:
+        return None
+    vertical_x = sorted({v[0] for v in vertical if left + 3 < v[0] < right - 3 and
+                         v[1] <= top[1] + 3 and v[3] >= separator[1] - 3})
+    vertical_x = [x for i, x in enumerate(vertical_x) if i == 0 or x - vertical_x[i - 1] > 2]
+    if vertical_x:
+        xs = [left] + vertical_x + [right]
+        column_source = "printed_header_dividers"
+    else:
+        # Union whole text-shaped runs over all body lines. A separator must be
+        # persistent whitespace; spaces inside one numeric value are insufficient.
+        intervals = [r for line in body_lines for r in _runs(line, 2 * char_width)]
+        occupied = _runs([[a, 0, b, 1] for a, b in intervals], 0)
+        gaps = [(a[1], b[0]) for a, b in zip(occupied, occupied[1:])
+                if b[0] - a[1] >= max(4, 2 * char_width)]
+        xs = [left] + [(a + b) / 2 for a, b in gaps] + [right]
+        # The lowest header line provides separate column labels. Move a
+        # divider within its body gutter if that avoids cutting a header label.
+        labels = _runs(header_lines[-1], 2 * char_width)
+        for index, (a, b) in enumerate(gaps, 1):
+            nearby = [r for r in labels if r[0] < b and r[1] > a]
+            for label in nearby:
+                if label[0] < xs[index] < label[1]:
+                    alternatives = [r for r in labels if r[1] <= label[0]]
+                    if alternatives and a <= (alternatives[-1][1] + label[0]) / 2 <= b:
+                        xs[index] = (alternatives[-1][1] + label[0]) / 2
+        column_source = "persistent_body_whitespace"
+    if not 3 <= len(xs) <= 33 or any(b - a < 4 for a, b in zip(xs, xs[1:])):
+        return None
+    old_columns = max(len({round(b[i], 1) for b in groups[index] for i in (0, 2)}) - 1
+                      for index in cluster["indices"])
+    if not vertical_x and len(xs) - 1 < old_columns:
+        return None
+    anchor = [i for i, line in enumerate(body_lines) if
+              any(left <= (b[0] + b[2]) / 2 < xs[1] for b in line)]
+    if len(anchor) < 3 or anchor[0] != 0 or len(anchor) < .4 * len(body_lines):
+        return None
+    records = [sum(body_lines[start:end], []) for start, end in
+               zip(anchor, anchor[1:] + [len(body_lines)])]
+    # Every inferred column must have body ink in multiple independent records.
+    if any(sum(any(xs[c] <= (b[0] + b[2]) / 2 < xs[c + 1] for b in record)
+               for record in records) < 2 for c in range(len(xs) - 1)):
+        return None
+    if not bottom_rules:
+        bottom = max(b[3] for b in records[-1]) + min(3, char_height / 2)
+    body_ys = [separator[1]] + [(max(b[3] for b in first) + min(b[1] for b in second)) / 2
+        for first, second in zip(records, records[1:])] + [bottom]
+    if any(b - a < 3 for a, b in zip(body_ys, body_ys[1:])):
+        return None
+    # Printed full-height header dividers indicate wrapped labels in a single
+    # header row. Without them, a heading crossing body dividers supports spans.
+    grouped = not vertical_x and len(header_lines) > 1 and any(
+        any(a + 1 < x < b - 1 for x in xs[1:-1])
+        for line in header_lines[:-1] for a, b in _runs(line, 2 * char_width))
+    if grouped:
+        header_ys = [top[1]] + [(max(b[3] for b in first) + min(b[1] for b in second)) / 2
+            for first, second in zip(header_lines, header_lines[1:])] + [separator[1]]
+        header_bands = header_lines
+    else:
+        header_ys, header_bands = [top[1], separator[1]], [header]
+    cells = []
+    for row, band in enumerate(header_bands):
+        joins = set()
+        if grouped and row < len(header_bands) - 1:
+            for a, b in _runs(band, 2 * char_width):
+                joins.update(i for i, x in enumerate(xs[1:-1], 1) if a + 1 < x < b - 1)
+        edges = [0] + [i for i in range(1, len(xs) - 1) if i not in joins] + [len(xs) - 1]
+        cells.extend((xs[a], header_ys[row], xs[b], header_ys[row + 1])
+                     for a, b in zip(edges, edges[1:]))
+    cells.extend((a, top_y, b, bottom_y) for top_y, bottom_y in zip(body_ys, body_ys[1:])
+                 for a, b in zip(xs, xs[1:]))
+    return cells, {"status": "repaired", "basis": "printed_rules_and_pixel_geometry",
+        "column_source": column_source, "header_rows": len(header_bands),
+        "body_rows": len(records), "body_text_lines": len(body_lines),
+        "columns": len(xs) - 1, "bottom_rule": bool(bottom_rules),
+        "source_group_indices": cluster["indices"], "bbox": [left, top[1], right, bottom],
+        "semantic_structure_verified": False}
+
+
+def repair_groups(groups, horizontal, vertical, read_components):
+    """Return groups and aligned repair notes; preserve inputs on no evidence."""
+    result, notes = [], []
+    for index, cluster in enumerate(_clusters(groups)):
+        repaired = _repair(cluster, groups, horizontal, vertical, read_components) \
+            if index < MAX_REPAIR_CLUSTERS else None
+        if repaired:
+            cells, note = repaired
+            result.append(cells)
+            notes.append(note)
+        else:
+            for original in cluster["indices"]:
+                result.append(groups[original])
+                notes.append({"status": "unchanged", "source_group_indices": [original]})
+    return result, notes
+
+
+def repair_word_groups(groups, horizontal, words):
+    """Recover a ruled table envelope using selectable-word positions only.
+
+    Repeated occupancy in the non-label columns identifies records, so wrapped
+    row labels can remain in the same cell. A matching header column pattern
+    and printed bottom rule are mandatory; words are never interpreted.
+    """
+    result, notes = [], []
+    for cluster_index, cluster in enumerate(_clusters(groups)):
+        if cluster_index >= MAX_REPAIR_CLUSTERS:
+            for original in cluster["indices"]:
+                result.append(groups[original])
+                notes.append({"status": "unchanged", "source_group_indices": [original]})
+            continue
+        seed = cluster["bbox"]
+        width = seed[2] - seed[0]
+        rules = sorted([r for r in horizontal if r[2] - r[0] >= .85 * width and
+            _overlap(r, seed) >= .9 * width and seed[1] - 200 <= r[1] <= seed[3] + 12],
+            key=lambda r: r[1])
+        bottoms = [r for r in rules if abs(r[1] - seed[3]) <= 12]
+        repaired = None
+        if bottoms:
+            bottom = min(bottoms, key=lambda r: abs(r[1] - seed[3]))
+            for top, separator in zip(rules, rules[1:]):
+                if not (8 <= separator[1] - top[1] <= 60 and
+                        separator[1] <= seed[1] + min(60, .5 * (seed[3] - seed[1])) and
+                        separator[1] < bottom[1] - 30):
+                    continue
+                left = max(top[0], separator[0], bottom[0])
+                right = min(top[2], separator[2], bottom[2])
+                if right - left < .85 * width:
+                    continue
+                inside = [b for b in words if left - 2 <= (b[0] + b[2]) / 2 <= right + 2]
+                header = [b for b in inside if top[1] < (b[1] + b[3]) / 2 < separator[1]]
+                body = [b for b in inside if separator[1] < (b[1] + b[3]) / 2 < bottom[1]]
+                if not header or not body or len(body) > MAX_COMPONENTS:
+                    continue
+                lines, _, height = _lines(body, minimum_boxes=1)
+                if not 3 <= len(lines) <= 200:
+                    continue
+                gap = max(4, height * .5)
+                header_columns, body_columns = _runs(header, gap), _runs(body, gap)
+                if not 3 <= len(body_columns) <= 32 or len(header_columns) != len(body_columns):
+                    continue
+                xs = [left] + [(a[1] + b[0]) / 2 for a, b in zip(body_columns, body_columns[1:])] + [right]
+                # The complete header must agree with the body-derived columns.
+                if any(a < x < b for a, b in header_columns for x in xs[1:-1]):
+                    continue
+                occupied = [set(c for c in range(len(xs) - 1) if any(
+                    xs[c] <= (b[0] + b[2]) / 2 < xs[c + 1] for b in line)) for line in lines]
+                # A majority of columns can still contain continuation text.
+                # Repeated starts spanning every column provide stronger anchors;
+                # sparse/ambiguous layouts retain their original candidate.
+                anchors = [i for i, cols in enumerate(occupied) if len(cols) == len(xs) - 1]
+                if len(anchors) < 3 or anchors[0] != 0:
+                    continue
+                # A row with one blank value can resemble wrapped prose. Do not
+                # absorb a dense, leading-label line when its spacing suggests
+                # a separate record. Both checks are geometric; no labels or
+                # cell values are interpreted.
+                starts = [min(b[1] for b in line) for line in lines]
+                record_pitch = min(starts[b] - starts[a] for a, b in zip(anchors, anchors[1:]))
+                line_ends = [max(b[3] for b in line) for line in lines]
+                record_gaps = [starts[i] - line_ends[i - 1] for i in anchors[1:]]
+                continuation_gaps = [starts[i] - line_ends[i - 1]
+                                     for i in range(1, len(lines)) if i not in anchors]
+                # Short one-line records need not share the pitch of wrapped
+                # records. Permit that distinction only when repeated complete
+                # record starts are separated more widely than EVERY inferred
+                # continuation. Equal/mixed spacing keeps the old ambiguity
+                # guard for sparse records whose grouping is not established.
+                separated_spacing = bool(len(record_gaps) >= 3 and
+                    len(continuation_gaps) >= 2 and min(continuation_gaps) >= 0 and
+                    max(continuation_gaps) <= height * .5 + .5 and
+                    min(record_gaps) - max(continuation_gaps) >= max(.5, height * .1))
+                ambiguous = False
+                previous_anchor = 0
+                for index, cols in enumerate(occupied):
+                    if index in anchors:
+                        previous_anchor = index
+                    elif 0 in cols and len(cols) >= max(2, (len(xs) - 1) * .5):
+                        gap_before = starts[index] - max(b[3] for b in lines[index - 1])
+                        if gap_before > height * .5 + .5 or \
+                                (starts[index] - starts[previous_anchor] >= .8 * record_pitch
+                                 and not separated_spacing):
+                            ambiguous = True
+                            break
+                if ambiguous:
+                    continue
+                records = [sum(lines[a:b], []) for a, b in zip(anchors, anchors[1:] + [len(lines)])]
+                if any(not any(xs[0] <= (b[0] + b[2]) / 2 < xs[1] for b in record) for record in records):
+                    continue
+                ys = [top[1], separator[1]] + [
+                    (max(b[3] for b in a) + min(b[1] for b in b_line)) / 2
+                    for a, b_line in zip(records, records[1:])] + [bottom[1]]
+                if any(b - a < 3 for a, b in zip(ys, ys[1:])):
+                    continue
+                cells = [(a, c, b, d) for c, d in zip(ys, ys[1:]) for a, b in zip(xs, xs[1:])]
+                repaired = cells, {"status": "repaired", "basis": "printed_rules_and_word_positions",
+                    "column_source": "matching_header_and_body_whitespace", "header_rows": 1,
+                    "body_rows": len(records), "body_text_lines": len(lines), "columns": len(xs) - 1,
+                    "bottom_rule": True, "source_group_indices": cluster["indices"],
+                    "bbox": [left, top[1], right, bottom[1]], "semantic_structure_verified": False}
+                if separated_spacing:
+                    repaired[1]["row_spacing_evidence"] = {
+                        "minimum_record_gap_points": round(min(record_gaps), 3),
+                        "maximum_continuation_gap_points": round(max(continuation_gaps), 3),
+                        "record_start_gaps": len(record_gaps),
+                        "continuation_gaps": len(continuation_gaps)}
+                break
+        if repaired:
+            cells, note = repaired
+            result.append(cells)
+            notes.append(note)
+        else:
+            for original in cluster["indices"]:
+                result.append(groups[original])
+                notes.append({"status": "unchanged", "source_group_indices": [original]})
+    return result, notes

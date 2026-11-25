@@ -1,5 +1,6 @@
 """Conservative local grid-table extraction; ambiguous layouts remain source text."""
 import re
+from content_accessibility_utility_on_aws.table_resolution.header_policy import established_column_headers
 
 
 def contains(outer, inner, tolerance=1):
@@ -7,7 +8,7 @@ def contains(outer, inner, tolerance=1):
             and inner[2] <= outer[2] + tolerance and inner[3] <= outer[3] + tolerance)
 
 
-def extract_tables(page, blocks, render_line):
+def extract_tables(page, blocks, render_line, exclude=()):
     replacements, entries = [], []
     captions = [b for b in blocks if 'lines' in b and re.match(
         r'^Table\s+\d+\b', ' '.join(s['text'] for l in b['lines'] for s in l['spans']).strip(), re.I)]
@@ -18,6 +19,8 @@ def extract_tables(page, blocks, render_line):
     used_captions = set()
     for table in tables:
         box = table.bbox
+        if any(box[0] < b[2] and box[2] > b[0] and box[1] < b[3] and box[3] > b[1] for b in exclude):
+            continue
         reason = None
         rows = table.rows
         if len(rows) < 2 or table.col_count < 2 or any(
@@ -41,16 +44,21 @@ def extract_tables(page, blocks, render_line):
                 reason = 'Vector artwork within cells requires review.'
         cell_rows = []
         if not reason:
+            fonts = [[], []]
+            labels = []
             for row_index, row in enumerate(rows):
                 cells = []
                 for cell in row.cells:
                     lines = [line for block in blocks for line in block.get('lines', [])
                              if contains(cell, line['bbox'])]
                     spans = [s for line in lines for s in line['spans'] if s['text'].strip()]
-                    if row_index == 0 and (not spans or not all('bold' in s.get('font', '').lower() for s in spans)):
-                        reason = 'Column header semantics are uncertain.'
+                    fonts[min(1, row_index)].extend('bold' in span.get('font', '').lower() for span in spans)
+                    if row_index == 0:
+                        labels.append(' '.join(span['text'] for span in spans))
                     cells.append(' '.join(render_line(line) for line in sorted(lines, key=lambda l: l['bbox'][1])))
                 cell_rows.append(cells)
+            if not established_column_headers(labels, *(sum(f)/max(1,len(f)) for f in fonts)):
+                reason = 'Column header semantics are uncertain.'
         if reason:
             entries.append({'status': 'needs_review', 'bbox': list(box), 'reason': reason})
             continue
